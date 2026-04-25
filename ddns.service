@@ -1,0 +1,21 @@
+[Unit]
+Description=TX_DDNS Dynamic DNS Updater
+Documentation=https://github.com/skysr/TX_DDNS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ddnsv2.sh -q
+StandardOutput=journal
+StandardError=journal
+
+# 安全设置
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/ddns
+
+[Install]
+WantedBy=multi-user.target

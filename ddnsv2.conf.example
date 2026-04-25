@@ -1,7 +1,10 @@
 # TX_DDNS 配置文件
 # 复制此文件为 ddnsv2.conf 并填入实际值
 
+# ============ 必填配置 ============
+
 # DNSPod API Token（ID,Token 格式）
+# 获取方式: https://console.dnspod.cn/user/user/api
 LOGIN_TOKEN='xxxxxxxx,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 
 # 域名信息
@@ -12,6 +15,8 @@ SUB_DOMAIN='xxxxxx'
 # 记录类型：AAAA（IPv6）或 A（IPv4）
 RECORD_TYPE='AAAA'
 
+# ============ 可选配置 ============
+
 # 网卡名称（用于获取 IP，留空则自动检测）
 NETWORK_INTERFACE=''
 
@@ -20,3 +25,24 @@ LOG_DIR='/var/log/ddns'
 
 # 强制更新周期（计数次数，每次 crontab 调用计一次）
 FORCE_UPDATE_CYCLE=60
+
+# DNS 记录 TTL（秒），最小值取决于 DNSPod 设置
+RECORD_TTL=600
+
+# API 重试次数
+MAX_RETRY=3
+
+# 重试间隔（秒）
+RETRY_DELAY=2
+
+# 更新历史最大记录数
+HISTORY_MAX=100
+
+# ============ Webhook 通知 ============
+# 支持: 通用 JSON、Discord、Slack、Telegram 等
+
+# Webhook URL（留空则不发送通知）
+WEBHOOK_URL=''
+
+# Webhook 方法（POST 或 GET）
+WEBHOOK_METHOD='POST'

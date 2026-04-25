@@ -1,0 +1,14 @@
+[Unit]
+Description=TX_DDNS Timer - Run DDNS update periodically
+Documentation=https://github.com/skysr/TX_DDNS
+
+[Timer]
+# 每分钟执行一次
+OnCalendar=*:*:00
+# 如果错过了执行时间，启动后立即执行
+Persistent=true
+# 随机延迟 0-30 秒，避免准点请求拥堵
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target
