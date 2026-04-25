@@ -1,0 +1,22 @@
+# TX_DDNS 配置文件
+# 复制此文件为 ddnsv2.conf 并填入实际值
+
+# DNSPod API Token（ID,Token 格式）
+LOGIN_TOKEN='xxxxxxxx,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+
+# 域名信息
+DOMAIN_ID='xxxxxxxxxxx'
+RECORD_ID='xxxxxxxxxxxx'
+SUB_DOMAIN='xxxxxx'
+
+# 记录类型：AAAA（IPv6）或 A（IPv4）
+RECORD_TYPE='AAAA'
+
+# 网卡名称（用于获取 IP，留空则自动检测）
+NETWORK_INTERFACE=''
+
+# 日志目录
+LOG_DIR='/var/log/ddns'
+
+# 强制更新周期（计数次数，每次 crontab 调用计一次）
+FORCE_UPDATE_CYCLE=60
