@@ -65,6 +65,7 @@ set -e  # 遇到错误立即退出
 #-------------------------------------------------------------------------------
 
 readonly VERSION="2.6.0"                    # 脚本版本号
+readonly API_BASE_URL="https://dnsapi.cn"    # DNSPod API 基础地址
 readonly SCRIPT_NAME=$(basename "$0")        # 脚本名称
 
 # 脚本所在目录（用于定位配置文件）
@@ -643,8 +644,25 @@ init_dirs() {
     fi
 
     # 初始化文件（如果不存在）
-    [ -f "$LOG_FILE" ] || touch "$LOG_FILE"
-    [ -f "$HISTORY_FILE" ] || touch "$HISTORY_FILE"
+    # 写入失败必须明确报错——否则后续的状态落盘会静默失败，
+    # 而脚本会一直报告"更新成功"。
+    if [ ! -f "$LOG_FILE" ] && ! touch "$LOG_FILE" 2>/dev/null; then
+        log_error "无法创建日志文件: $LOG_FILE"
+        log_error "请检查目录权限与磁盘空间: $LOG_DIR"
+        exit 1
+    fi
+    if [ ! -f "$HISTORY_FILE" ] && ! touch "$HISTORY_FILE" 2>/dev/null; then
+        log_error "无法创建历史记录文件: $HISTORY_FILE"
+        log_error "请检查目录权限与磁盘空间: $LOG_DIR"
+        exit 1
+    fi
+
+    # 目录必须可写，否则后续状态文件无法落盘
+    if [ ! -w "$LOG_DIR" ]; then
+        log_error "日志目录不可写: $LOG_DIR"
+        log_error "状态文件（IP 记录、更新计数）无法保存，DDNS 将无法正常工作"
+        exit 1
+    fi
 
     log_debug "目录初始化完成: $LOG_DIR"
 }
@@ -766,7 +784,7 @@ check_network() {
     if ! command -v ping >/dev/null 2>&1; then
         log_debug "ping 不可用，改用 curl 探测"
         for ((i=1; i<=attempts; i++)); do
-            if curl -s -o /dev/null --connect-timeout "$timeout" https://dnsapi.cn 2>/dev/null; then
+            if curl -s -o /dev/null --connect-timeout "$timeout" "$API_BASE_URL" 2>/dev/null; then
                 log_debug "网络检查通过 (curl)"
                 return 0
             fi
@@ -1229,18 +1247,16 @@ call_dns_api() {
 
         # 调用 DNSPod Record.Modify API
         # 文档: https://docs.dnspod.cn/api/record_modify/
-        response=$(curl -s -X POST https://dnsapi.cn/Record.Modify \
-            -d "login_token=$LOGIN_TOKEN" \
-            -d "format=json" \
-            -d "domain_id=$api_domain" \
-            -d "record_id=$api_record" \
-            -d "record_line_id=0" \
-            -d "sub_domain=$api_sub" \
-            -d "value=$value" \
-            -d "record_type=$api_type" \
-            -d "ttl=$api_ttl" \
-            --connect-timeout 10 \
-            --max-time 30 2>&1)
+        response=$(api_post "Record.Modify" \
+            "login_token=$LOGIN_TOKEN" \
+            "format=json" \
+            "domain_id=$api_domain" \
+            "record_id=$api_record" \
+            "record_line_id=0" \
+            "sub_domain=$api_sub" \
+            "value=$value" \
+            "record_type=$api_type" \
+            "ttl=$api_ttl")
 
         code=$(parse_json_field "$response" "code")
         message=$(parse_json_field "$response" "message")
@@ -1385,8 +1401,9 @@ do_test() {
     echo ""
     echo "✓ 测试 API Token..."
     local response
-    response=$(curl -s -X POST https://dnsapi.cn/Info.Version \
-        -d "login_token=$LOGIN_TOKEN&format=json" 2>&1)
+    response=$(api_post "Info.Version" \
+        "login_token=$LOGIN_TOKEN" \
+        "format=json")
 
     local code=$(parse_json_field "$response" "code")
     if [ "$code" = "1" ]; then
@@ -1414,8 +1431,11 @@ do_test() {
             echo "✓ 测试记录 $((idx + 1))/$REC_COUNT: $sub ($rtype)"
 
             # 域名和记录访问权限
-            response=$(curl -s -X POST https://dnsapi.cn/Record.Info \
-                -d "login_token=$LOGIN_TOKEN&format=json&domain_id=${REC_DOMAIN[$idx]}&record_id=${REC_ID[$idx]}" 2>&1)
+            response=$(api_post "Record.Info" \
+                "login_token=$LOGIN_TOKEN" \
+                "format=json" \
+                "domain_id=${REC_DOMAIN[$idx]}" \
+                "record_id=${REC_ID[$idx]}")
 
             code=$(parse_json_field "$response" "code")
             if [ "$code" = "1" ]; then
@@ -1548,6 +1568,40 @@ parse_domain_info() {
 }
 
 #-------------------------------------------------------------------------------
+# FUNCTION: api_post
+# DESCRIPTION: 调用 DNSPod API
+#
+#              凭据只经 stdin 传给 curl，不出现在进程命令行（argv）里。
+#              否则 `ps aux` / /proc/<pid>/cmdline 能看到 login_token，
+#              任何本机用户都能读到 DNSPod API 凭据。
+#
+# PARAMETERS:
+#   $1 - 接口路径（如 Record.Modify）
+#   $2... - 表单参数（key=value 形式，值需自行 URL 编码）
+# OUTPUT: API 响应
+#-------------------------------------------------------------------------------
+api_post() {
+    local endpoint="$1"
+    shift
+
+    # 用 printf 构造 body，值逐个 URL 编码后经管道交给 curl
+    local body=""
+    local kv key value
+    for kv in "$@"; do
+        key="${kv%%=*}"
+        value="${kv#*=}"
+        [ -n "$body" ] && body+="&"
+        body+="${key}=$(urlencode "$value")"
+    done
+
+    printf '%s' "$body" | curl -s -X POST "${API_BASE_URL}/${endpoint}" \
+        --data-binary @- \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --connect-timeout 10 \
+        --max-time 30 2>&1
+}
+
+#-------------------------------------------------------------------------------
 # FUNCTION: parse_json_records
 # DESCRIPTION: 解析 DNSPod Record.List 响应中的 records 数组
 #              逐条输出: 记录ID|子域名|类型|TTL
@@ -1594,12 +1648,10 @@ parse_json_records() {
 fetch_records() {
     local target="$1"
 
-    curl -s -X POST https://dnsapi.cn/Record.List \
-        -d "login_token=$LOGIN_TOKEN" \
-        -d "format=json" \
-        -d "domain=$target" \
-        --connect-timeout 10 \
-        --max-time 30 2>&1
+    api_post "Record.List" \
+        "login_token=$LOGIN_TOKEN" \
+        "format=json" \
+        "domain=$target"
 }
 
 #-------------------------------------------------------------------------------
@@ -1924,8 +1976,15 @@ process_record() {
     # 条件 2: 达到强制更新周期（防止 DNS 记录被篡改或过期）
     if [ "$current_ip" = "$old_ip" ] && [ "$update_flag" -lt "$FORCE_UPDATE_CYCLE" ]; then
         log_info "[$sub] IP 未变化，跳过更新"
-        # 递增更新计数器
-        safe_write "$((update_flag + 1))" "$FLAG_FILE"
+        # 递增更新计数器。写入失败不影响本次跳过判断的正确性
+        #（IP 确实没变），但意味着下次无法准确判断强制更新周期，
+        # 因此记录为失败并告警。
+        if ! safe_write "$((update_flag + 1))" "$FLAG_FILE"; then
+            log_error "[$sub] 更新计数器写入失败: $FLAG_FILE"
+            log_error "[$sub] DNS 未受影响，但强制更新周期判断已失准"
+            record_history "error" "${old_ip:-无}" "$current_ip" "状态写入失败（计数器）" "$sub"
+            return 1
+        fi
         return 0
     fi
 
@@ -1946,8 +2005,26 @@ process_record() {
     # 处理更新结果
     if [ "$code" = "1" ]; then
         # 成功后才写入状态：保存新 IP 并重置计数器
-        safe_write "$current_ip" "$DB_FILE"
-        safe_write "0" "$FLAG_FILE"
+        #
+        # 状态写入失败必须报错：DNS 虽然已经更新成功，但脚本的"已同步"
+        # 状态没有落盘，下一轮会重复推送同一 IP。属于状态不一致，
+        # 不能报成功。
+        local state_ok=1
+        if ! safe_write "$current_ip" "$DB_FILE"; then
+            log_error "[$sub] 状态写入失败: $DB_FILE"
+            state_ok=0
+        fi
+        if ! safe_write "0" "$FLAG_FILE"; then
+            log_error "[$sub] 状态写入失败: $FLAG_FILE"
+            state_ok=0
+        fi
+
+        if [ "$state_ok" -eq 0 ]; then
+            log_error "[$sub] DNS 更新成功但状态落盘失败，下一轮将重复推送"
+            record_history "error" "${old_ip:-无}" "$current_ip" "状态写入失败" "$sub"
+            send_webhook "error" "$current_ip" "DNS 已更新但状态写入失败: $sub" "$sub"
+            return 1
+        fi
 
         log_info "[$sub] 更新成功: $sub -> $current_ip (TTL: $ttl)"
         record_history "success" "${old_ip:-无}" "$current_ip" "$message" "$sub"
