@@ -643,8 +643,25 @@ init_dirs() {
     fi
 
     # 初始化文件（如果不存在）
-    [ -f "$LOG_FILE" ] || touch "$LOG_FILE"
-    [ -f "$HISTORY_FILE" ] || touch "$HISTORY_FILE"
+    # 写入失败必须明确报错——否则后续的状态落盘会静默失败，
+    # 而脚本会一直报告"更新成功"。
+    if [ ! -f "$LOG_FILE" ] && ! touch "$LOG_FILE" 2>/dev/null; then
+        log_error "无法创建日志文件: $LOG_FILE"
+        log_error "请检查目录权限与磁盘空间: $LOG_DIR"
+        exit 1
+    fi
+    if [ ! -f "$HISTORY_FILE" ] && ! touch "$HISTORY_FILE" 2>/dev/null; then
+        log_error "无法创建历史记录文件: $HISTORY_FILE"
+        log_error "请检查目录权限与磁盘空间: $LOG_DIR"
+        exit 1
+    fi
+
+    # 目录必须可写，否则后续状态文件无法落盘
+    if [ ! -w "$LOG_DIR" ]; then
+        log_error "日志目录不可写: $LOG_DIR"
+        log_error "状态文件（IP 记录、更新计数）无法保存，DDNS 将无法正常工作"
+        exit 1
+    fi
 
     log_debug "目录初始化完成: $LOG_DIR"
 }
@@ -1924,8 +1941,15 @@ process_record() {
     # 条件 2: 达到强制更新周期（防止 DNS 记录被篡改或过期）
     if [ "$current_ip" = "$old_ip" ] && [ "$update_flag" -lt "$FORCE_UPDATE_CYCLE" ]; then
         log_info "[$sub] IP 未变化，跳过更新"
-        # 递增更新计数器
-        safe_write "$((update_flag + 1))" "$FLAG_FILE"
+        # 递增更新计数器。写入失败不影响本次跳过判断的正确性
+        #（IP 确实没变），但意味着下次无法准确判断强制更新周期，
+        # 因此记录为失败并告警。
+        if ! safe_write "$((update_flag + 1))" "$FLAG_FILE"; then
+            log_error "[$sub] 更新计数器写入失败: $FLAG_FILE"
+            log_error "[$sub] DNS 未受影响，但强制更新周期判断已失准"
+            record_history "error" "${old_ip:-无}" "$current_ip" "状态写入失败（计数器）" "$sub"
+            return 1
+        fi
         return 0
     fi
 
@@ -1946,8 +1970,26 @@ process_record() {
     # 处理更新结果
     if [ "$code" = "1" ]; then
         # 成功后才写入状态：保存新 IP 并重置计数器
-        safe_write "$current_ip" "$DB_FILE"
-        safe_write "0" "$FLAG_FILE"
+        #
+        # 状态写入失败必须报错：DNS 虽然已经更新成功，但脚本的"已同步"
+        # 状态没有落盘，下一轮会重复推送同一 IP。属于状态不一致，
+        # 不能报成功。
+        local state_ok=1
+        if ! safe_write "$current_ip" "$DB_FILE"; then
+            log_error "[$sub] 状态写入失败: $DB_FILE"
+            state_ok=0
+        fi
+        if ! safe_write "0" "$FLAG_FILE"; then
+            log_error "[$sub] 状态写入失败: $FLAG_FILE"
+            state_ok=0
+        fi
+
+        if [ "$state_ok" -eq 0 ]; then
+            log_error "[$sub] DNS 更新成功但状态落盘失败，下一轮将重复推送"
+            record_history "error" "${old_ip:-无}" "$current_ip" "状态写入失败" "$sub"
+            send_webhook "error" "$current_ip" "DNS 已更新但状态写入失败: $sub" "$sub"
+            return 1
+        fi
 
         log_info "[$sub] 更新成功: $sub -> $current_ip (TTL: $ttl)"
         record_history "success" "${old_ip:-无}" "$current_ip" "$message" "$sub"

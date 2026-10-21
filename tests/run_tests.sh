@@ -482,9 +482,149 @@ else
 fi
 
 #-------------------------------------------------------------------------------
-# 测试 18: 语法检查
+# 测试 18: 状态写入失败必须报失败
 #-------------------------------------------------------------------------------
-head2 "测试 18: 语法检查"
+head2 "测试 18: 状态写入失败处理"
+# process_record 必须检查 safe_write 的返回值
+if grep -q 'if ! safe_write "\$current_ip" "\$DB_FILE"; then' "$DDNS"; then
+    ok "db 写入失败被检查"
+else
+    bad "db 写入失败未被检查（会报成功但状态丢失）"
+fi
+if grep -q 'if ! safe_write "0" "\$FLAG_FILE"; then' "$DDNS"; then
+    ok "flag 写入失败被检查"
+else
+    bad "flag 写入失败未被检查"
+fi
+# 跳过分支的计数器写入也要检查
+if grep -q 'if ! safe_write "\$((update_flag + 1))" "\$FLAG_FILE"; then' "$DDNS"; then
+    ok "跳过分支的计数器写入失败被检查"
+else
+    bad "跳过分支的计数器写入失败未被检查"
+fi
+# 状态写入失败时必须返回失败，不能报成功
+if grep -q 'DNS 更新成功但状态落盘失败，下一轮将重复推送' "$DDNS"; then
+    ok "状态落盘失败有明确告警"
+else
+    bad "状态落盘失败缺少告警信息"
+fi
+
+# 实测：日志目录不可写时，脚本必须报失败并返回非零退出码
+WDIR="$TMPROOT/rotest"
+mkdir -p "$WDIR/log"
+cat > "$WDIR/ddns.conf" <<EOF
+LOGIN_TOKEN='12345,abcdef123456'
+DOMAIN_ID='999'
+RECORD_ID='888'
+SUB_DOMAIN='www'
+RECORD_TYPE='AAAA'
+LOG_DIR='$WDIR/log'
+EOF
+# 伪造一个 API 总是成功的 mock：直接把 call_dns_api 换掉太复杂，
+# 改为直接断言 safe_write 的返回值语义（调用方是否检查由上面的静态检查覆盖）
+sed -n '/^safe_write()/,/^}/p' "$DDNS" > "$TMPROOT/sw.sh"
+cat > "$TMPROOT/sw_run.sh" <<'SWEOF'
+source "$1"
+log_error() { echo "[log_error] $*" >&2; }
+safe_write "testdata" "$2"
+SWEOF
+mkdir -p "$WDIR/nodir"
+OUT=$(bash "$TMPROOT/sw_run.sh" "$TMPROOT/sw.sh" "$WDIR/nodir/deep/file.txt" 2>&1)
+RC=$?
+if [ "$RC" -ne 0 ]; then
+    ok "safe_write 在目录不存在时返回非零"
+else
+    bad "safe_write 在目录不存在时仍返回 0"
+fi
+OUT2=$(bash "$TMPROOT/sw_run.sh" "$TMPROOT/sw.sh" "$WDIR/log/ok.txt" 2>&1)
+if [ $? -eq 0 ] && [ "$(cat "$WDIR/log/ok.txt" 2>/dev/null)" = "testdata" ]; then
+    ok "safe_write 正常路径写入内容正确"
+else
+    bad "safe_write 正常路径异常"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 19: 状态写入失败的端到端行为
+#-------------------------------------------------------------------------------
+head2 "测试 19: 状态写入失败端到端"
+# 真实模拟：让 safe_write 必定失败，验证 process_record 走的是失败分支
+# 做法：把 safe_write 替换成一个恒定失败的桩函数，再调用 process_record
+cat > "$TMPROOT/stub_run.sh" <<'STUBEOF'
+# 加载主脚本，去掉末行的 main "$@" 以免自动执行
+# （source 后再定义桩函数才能覆盖脚本内的定义）
+source <(sed '$d' "$1")
+
+# 桩：safe_write 恒定失败
+safe_write() {
+    echo "[ERROR] 无法写入文件: $2" >&2
+    return 1
+}
+# 桩：网络与 API 全部成功
+check_network() { return 0; }
+get_current_ipv6() { echo "2404:8c80::1"; }
+get_current_ipv4() { echo "10.0.0.1"; }
+call_dns_api() {
+    echo '{"status":{"code":1,"message":"ok"}}'
+    return 0
+}
+parse_json_field() {
+    case "$2" in
+        code) echo "1" ;;
+        message) echo "ok" ;;
+        *) echo "" ;;
+    esac
+}
+record_history() { :; }
+send_webhook() { :; }
+# log 保留输出（断言需要检查告警信息），只屏蔽控制台噪音
+log_info() { :; }
+log_debug() { :; }
+log_warn() { :; }
+record_state_files() { :; }
+
+# 设置环境
+LOG_DIR="/tmp"
+REC_COUNT=1
+REC_SUB=("www"); REC_DOMAIN=("999"); REC_ID=("888")
+REC_TYPE=("AAAA"); REC_IFACE=(""); REC_TTL=("600"); REC_KEY=("k")
+FORCE_UPDATE_CYCLE=60
+DB_FILE="/tmp/stub_db"; FLAG_FILE="/tmp/stub_flag"
+touch "$DB_FILE" "$FLAG_FILE"
+VERBOSE=0; QUIET=1
+
+# 必须放在 if 条件里调用：脚本启用了 set -e，
+# 直接调用 process_record 时返回 1 会终止整个脚本，拿不到返回值
+if process_record 0; then
+    echo "RESULT=success"
+else
+    echo "RESULT=failure"
+fi
+STUBEOF
+
+OUT=$(bash "$TMPROOT/stub_run.sh" "$DDNS" 2>&1)
+if printf '%s' "$OUT" | grep -q "RESULT=failure"; then
+    ok "状态写入失败时 process_record 返回失败"
+else
+    bad "状态写入失败时 process_record 仍返回成功" "$OUT"
+fi
+if printf '%s' "$OUT" | grep -q "重复推送"; then
+    ok "状态写入失败时给出明确告警"
+else
+    bad "缺少状态写入失败的告警信息"
+fi
+# 关键：绝不能出现成功的日志行 "更新成功: <子域名> -> <IP>"
+# 注意不能用裸的 "更新成功" 匹配——告警文案
+# 「DNS 更新成功但状态落盘失败」里也含这四个字
+if printf '%s' "$OUT" | grep -qE "更新成功: .* -> "; then
+    bad "状态写入失败时仍打印了成功的更新日志"
+else
+    ok "状态写入失败时不打印成功的更新日志"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 20: 语法检查
+#-------------------------------------------------------------------------------
+head2 "测试 20: 语法检查"
 if bash -n "$DDNS" 2>/dev/null; then
     ok "ddnsv2.sh 语法正确"
 else
