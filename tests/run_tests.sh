@@ -205,9 +205,167 @@ GOT=$(pf '{"status":{"code":1,"message":"\u64cd\u4f5c\u6210\u529f"}}' message)
                         || bad "中文转义解码错误" "得到: $GOT"
 
 #-------------------------------------------------------------------------------
-# 测试 10: 语法检查
+# 测试 10: 多记录支持
 #-------------------------------------------------------------------------------
-head2 "测试 10: 语法检查"
+head2 "测试 10: 多记录解析"
+MDIR="$TMPROOT/multi"
+mkdir -p "$MDIR/log"
+cat > "$MDIR/ddns.conf" <<EOF
+LOGIN_TOKEN='12345,abcdef123456'
+RECORDS_FILE='$MDIR/records.list'
+LOG_DIR='$MDIR/log'
+RECORD_TYPE='AAAA'
+RECORD_TTL=600
+EOF
+cat > "$MDIR/records.list" <<'EOF'
+# 子域名|域名ID|记录ID|类型|网卡|TTL
+www|100|201|AAAA|eth0|600
+nas|100|202|AAAA||
+home|200|203|A||300
+@|100|204|AAAA|eth0|
+*|100|205|AAAA|eth0|900
+EOF
+
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "共计 5 条记录"; then
+    ok "list 命令识别出 5 条记录"
+else
+    bad "list 命令记录数不正确" "$(echo "$OUT" | tail -3 | tr '\n' ' ')"
+fi
+if echo "$OUT" | grep -qE "home.*A.*200.*203.*300"; then
+    ok "字段回退正确（home 显式 TTL=300，类型 A）"
+else
+    bad "字段回退不正确"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 11: 记录 key 唯一性（@ 与 * 不能冲突）
+#-------------------------------------------------------------------------------
+head2 "测试 11: 记录 key 唯一性"
+sed -n '/^record_key()/,/^}/p' "$DDNS" > "$TMPROOT/rk.sh"
+K_AT=$(bash -c "source '$TMPROOT/rk.sh'; record_key '@' AAAA 100")
+K_STAR=$(bash -c "source '$TMPROOT/rk.sh'; record_key '*' AAAA 100")
+K_WWW=$(bash -c "source '$TMPROOT/rk.sh'; record_key 'www' AAAA 100")
+if [ "$K_AT" != "$K_STAR" ] && [ "$K_AT" != "$K_WWW" ] && [ "$K_STAR" != "$K_WWW" ]; then
+    ok "不同子域名生成不同 key（@ / * / www 互不冲突）"
+else
+    bad "记录 key 冲突" "@=$K_AT *=$K_STAR www=$K_WWW"
+fi
+# key 必须是安全文件名
+case "$K_AT" in
+    *[!a-zA-Z0-9._-]*) bad "key 含不安全字符: $K_AT" ;;
+    *) ok "key 只含安全字符: $K_AT" ;;
+esac
+
+#-------------------------------------------------------------------------------
+# 测试 12: 多记录状态文件隔离
+#-------------------------------------------------------------------------------
+head2 "测试 12: 状态文件隔离"
+LOGIN_TOKEN='1,invalidtoken000' bash "$DDNS" -q -c "$MDIR/ddns.conf" >/dev/null 2>&1
+DB_COUNT=$(ls -1 "$MDIR/log"/db.* 2>/dev/null | wc -l)
+if [ "$DB_COUNT" -eq 5 ]; then
+    ok "5 条记录生成 5 个独立 db 文件"
+else
+    bad "状态文件数量不对" "期望 5，实际 $DB_COUNT"
+fi
+# 重复 key 会导致文件数少于记录数
+DUP=$(ls -1 "$MDIR/log"/db.* 2>/dev/null | sort | uniq -d | wc -l)
+if [ "$DUP" -eq 0 ]; then
+    ok "无重复状态文件"
+else
+    bad "存在重复状态文件（key 冲突）"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 13: 单记录模式向后兼容
+#-------------------------------------------------------------------------------
+head2 "测试 13: 单记录模式向后兼容"
+SDIR="$TMPROOT/single"
+mkdir -p "$SDIR/log"
+cat > "$SDIR/ddns.conf" <<EOF
+LOGIN_TOKEN='12345,abcdef123456'
+DOMAIN_ID='999'
+RECORD_ID='888'
+SUB_DOMAIN='www'
+RECORD_TYPE='AAAA'
+LOG_DIR='$SDIR/log'
+EOF
+LOGIN_TOKEN='1,invalidtoken000' bash "$DDNS" -q -c "$SDIR/ddns.conf" >/dev/null 2>&1
+if [ -f "$SDIR/log/db" ] && [ -f "$SDIR/log/flag" ]; then
+    ok "单记录模式沿用原有 db / flag 文件名"
+else
+    bad "单记录模式状态文件名变化（破坏向后兼容）"
+fi
+OUT=$(bash "$DDNS" list -c "$SDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "共计 1 条记录"; then
+    ok "单记录模式回退可用"
+else
+    bad "单记录模式回退失败" "$(echo "$OUT" | tail -3 | tr '\n' ' ')"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 14: 记录文件格式错误处理
+#-------------------------------------------------------------------------------
+head2 "测试 14: 记录文件错误处理"
+cat > "$MDIR/records.list" <<'EOF'
+www|100|201|AAAA|eth0|600|EXTRA
+EOF
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "字段过多"; then
+    ok "字段过多时报错"
+else
+    bad "字段过多未报错" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
+fi
+cat > "$MDIR/records.list" <<'EOF'
+www|100|201|INVALID
+EOF
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "记录类型必须是"; then
+    ok "非法记录类型时报错"
+else
+    bad "非法记录类型未报错"
+fi
+cat > "$MDIR/records.list" <<'EOF'
+www|100
+EOF
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "缺少必要字段"; then
+    ok "缺少必填字段时报错"
+else
+    bad "缺少必填字段未报错"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 15: 安装器生成配置的正确性
+#-------------------------------------------------------------------------------
+head2 "测试 15: 安装器配置生成"
+# 静态检查：install.sh 的兼容字段赋值必须按正确的下标解析记录行
+# 记录行格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL
+# 错误写法会把 DOMAIN_ID 赋成子域名、RECORD_ID 赋成域名ID
+if grep -q 'read -r SUB_DOMAIN DOMAIN_ID RECORD_ID RECORD_TYPE _ _ <<< "\${RECORDS_LINES\[0\]}"' "$SCRIPT_DIR/../install.sh"; then
+    ok "兼容字段按正确下标解析记录行"
+else
+    bad "兼容字段解析下标错误（DOMAIN_ID/RECORD_ID/SUB_DOMAIN 会错位）"
+fi
+
+# heredoc 里的 $[...] 会被当成命令替换展开，生成垃圾行
+if grep -qE '^\[ .*-ge 1 \] \|\|' "$SCRIPT_DIR/../install.sh"; then
+    bad "install.sh 中存在会被 heredoc 展开的 $[...] 表达式"
+else
+    ok "install.sh 无会被 heredoc 误展开的表达式"
+fi
+
+# 确认步骤不能用 [[ ]] && {...}：条件为假时整体退出码为 1，配合 set -e 会静默终止
+if grep -qE '\[\[ "\$confirm" =~ \^\[Nn\] \]\] &&' "$SCRIPT_DIR/../install.sh"; then
+    bad "确认步骤使用 [[ ]] && {...}，在 set -e 下会静默退出"
+else
+    ok "确认步骤使用 if 判断，无 set -e 静默退出风险"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 16: 语法检查
+#-------------------------------------------------------------------------------
+head2 "测试 16: 语法检查"
 if bash -n "$DDNS" 2>/dev/null; then
     ok "ddnsv2.sh 语法正确"
 else

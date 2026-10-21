@@ -13,7 +13,7 @@ _ddns_completion() {
     fi
 
     # 命令列表
-    local commands="run status test history"
+    local commands="run status test history list"
 
     # 选项列表
     local options="-v --verbose -q --quiet -c --config -V --version -h --help"
