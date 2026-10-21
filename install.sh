@@ -108,10 +108,17 @@ interactive_config() {
     prompt "请输入网卡名称 (留空自动检测): "
     read -r NETWORK_INTERFACE
 
-    # 更新间隔
+    # 更新间隔（分钟）
     prompt "更新间隔分钟数 [1]: "
     read -r interval
     INTERVAL="${interval:-1}"
+    [ "$INTERVAL" -ge 1 ] 2>/dev/null || INTERVAL=1
+
+    # 强制更新周期（分钟）：无论 IP 是否变化，都至少每 N 分钟重推一次
+    prompt "强制更新周期分钟数 [60]: "
+    read -r force_interval
+    FORCE_INTERVAL="${force_interval:-60}"
+    [ "$FORCE_INTERVAL" -ge 1 ] 2>/dev/null || FORCE_INTERVAL=60
 
     # TTL
     prompt "DNS TTL 秒数 [600]: "
@@ -172,11 +179,15 @@ RECORD_TTL='$RECORD_TTL'
 # 日志目录
 LOG_DIR='$LOG_DIR'
 
-# 强制更新周期（间隔分钟数 × 60）
-FORCE_UPDATE_CYCLE=$(((INTERVAL > 0 ? INTERVAL : 1) * 60))
+# 强制更新周期（以「检查次数」计）
+# 脚本每运行一次计数 +1，计数达到 FORCE_UPDATE_CYCLE 时强制重推一次。
+# 检查间隔 = INTERVAL 分钟，因此 N 分钟强制周期对应 N/INTERVAL 次检查。
+FORCE_UPDATE_CYCLE=$(( (FORCE_INTERVAL + INTERVAL - 1) / INTERVAL ))
+[ "$FORCE_UPDATE_CYCLE" -ge 1 ] || FORCE_UPDATE_CYCLE=1
 
 # Webhook 通知 (可选)
 WEBHOOK_URL='$WEBHOOK_URL'
+WEBHOOK_METHOD='POST'
 
 # 更新历史最大记录数
 HISTORY_MAX=100
@@ -218,7 +229,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=$LOG_DIR
+ReadWritePaths=$LOG_DIR /var/lock
 
 [Install]
 WantedBy=multi-user.target

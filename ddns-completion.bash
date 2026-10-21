@@ -2,8 +2,15 @@
 # 安装: source 此文件或复制到 /etc/bash_completion.d/
 
 _ddns_completion() {
-    local cur prev words cword
-    _init_completion || return
+    local cur prev
+
+    # _init_completion 来自 bash-completion 包，未安装时退化为最小实现
+    if declare -F _init_completion >/dev/null 2>&1; then
+        _init_completion || return
+    else
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+    fi
 
     # 命令列表
     local commands="run status test history"
