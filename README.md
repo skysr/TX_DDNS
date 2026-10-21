@@ -69,14 +69,28 @@ RECORD_TYPE='AAAA'
 
 # 可选配置
 NETWORK_INTERFACE='eth0'      # 网卡名称
-FORCE_UPDATE_CYCLE=60          # 强制更新周期
+LOG_DIR='/var/log/ddns'        # 日志与状态文件目录
+LOCK_DIR='/var/lock'           # 锁文件目录
+FORCE_UPDATE_CYCLE=60          # 强制更新周期（单位：检查次数）
 RECORD_TTL=600                 # DNS TTL (秒)
 MAX_RETRY=3                    # API 重试次数
 HISTORY_MAX=100                # 历史记录条数
 
 # Webhook 通知
 WEBHOOK_URL=''                 # 留空禁用
+WEBHOOK_METHOD='POST'          # POST 或 GET
+WEBHOOK_CHAT_ID=''             # Telegram chat_id
 ```
+
+### 关于 FORCE_UPDATE_CYCLE
+
+该值是**检查次数**而非分钟数。脚本每执行一次计数 +1，计数达到该值时即使 IP 未变
+也会强制重推一次 DNS。
+
+换算关系：`检查次数 = 强制周期(分钟) / 检查间隔(分钟)`
+
+例如检查间隔 5 分钟、希望每 60 分钟强制重推一次，则 `FORCE_UPDATE_CYCLE=12`。
+一键安装脚本会根据你填写的两个分钟数自动换算。
 
 ### 获取 DNSPod 参数
 
@@ -157,8 +171,15 @@ WEBHOOK_METHOD='POST'
 
 ```bash
 # 需要先创建 Bot 并获取 chat_id
+# 方式一：chat_id 放在配置里
 WEBHOOK_URL='https://api.telegram.org/bot<TOKEN>/sendMessage'
+WEBHOOK_CHAT_ID='123456789'
+
+# 方式二：chat_id 放在 URL 查询串里
+WEBHOOK_URL='https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=123456789'
 ```
+
+两种方式都未提供 chat_id 时会跳过发送并记录一条 WARN。
 
 ### 通用 JSON
 
@@ -232,8 +253,8 @@ tail -f /var/log/ddns/ddns.log
 
 时间                 | 状态   | 类型  | IP 变化                                   | 消息
 ----------------------------------------------------------------------------------------
-2025-04-25 16:30:00 | success| AAAA | 无 -> 2409:xxxx::xxxx                  | Operation failed
-2025-04-25 16:00:00 | success| AAAA | 2409:xxxx::xxxx -> 2409:yyyy::yyyy    | 
+2025-04-25 16:30:00 | success| AAAA | 无 -> 2409:xxxx::xxxx                  | 操作成功
+2025-04-25 16:00:00 | error  | AAAA | 2409:xxxx::xxxx -> 2409:yyyy::yyyy    | 更新失败: 域名未备案
 
 共计 15 条记录
 ==========================================
@@ -264,6 +285,16 @@ sudo ./install.sh uninstall
        ↓
 7. 记录历史 + 发送通知
 ```
+
+## 测试
+
+仓库自带回归测试，覆盖锁释放、僵尸锁清理、失败重试、错误计数等关键行为：
+
+```bash
+./tests/run_tests.sh
+```
+
+无需 root 权限，也不会调用真实的 DNSPod API。
 
 ## 故障排除
 
@@ -306,4 +337,29 @@ ip addr show
 
 ## 许可证
 
-MIT License
+MIT License — 见 [LICENSE](LICENSE)
+
+## 更新日志
+
+### v2.4.0
+
+修复了一批会导致 DDNS 静默失效的缺陷：
+
+- **锁目录永不释放**：锁用 `mkdir` 创建成目录，退出时却用 `rm -f` 删除，导致第二次
+  及之后的运行全部卡满 30 秒超时。DDNS 从第二次起实际处于完全失效状态。
+- **僵尸锁无法自愈**：PID 文件先被删除后，锁目录残留且无法被识别为僵尸，只能等超时。
+- **更新失败后不再重试**：IP 与计数器在调用 API *之前* 落盘，API 失败时状态已被写坏，
+  下一轮会判定"IP 未变化"而跳过更新，DNS 永久停留在旧值。现改为 API 成功后才落盘。
+- **`test` 命令遇错即崩**：`((errors++))` 在 `set -e` 下返回值非零，首次报错就终止脚本，
+  后续检查项不再执行，错误汇总永远打印不出来。
+- **`run` 子命令不可用**：README 与补全脚本都列出了 `run`，但参数解析并不接受它。
+- **Telegram 通知依赖 jq 且 chat_id 为空**：与"无外部依赖"的声明不符，通知实际发不出去。
+  现改为纯 bash URL 编码，并支持从配置或 URL 解析 chat_id。
+- **IPv4 校验接受前导零**：`010.1.1.1` 被当作八进制解析成 8，绕过范围校验。
+- **Slack 通知格式错误**：body 是 `payload={...}` 而非 JSON。
+- **JSON 解析不可靠**：DNSPod v2 返回嵌套结构 `{"status":{"code":1,...}}`，原实现靠
+  全文本 grep 匹配，可能取到其它层级的同名字段；现已优先解析 `status` 对象，并支持
+  解码 `\uXXXX` 中文转义。
+- **systemd 沙箱下无法写锁目录**：`ProtectSystem=strict` 未把 `/var/lock` 列入可写路径。
+
+同时新增 `tests/run_tests.sh` 回归测试套件与 MIT `LICENSE` 文件。

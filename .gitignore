@@ -1,0 +1,18 @@
+# 真实配置（含 DNSPod Token），切勿提交
+ddnsv2.conf
+ddns.conf
+
+# 运行时状态
+*.log
+*.log.*
+flag
+db
+
+# 锁文件
+*.lock
+*.pid
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

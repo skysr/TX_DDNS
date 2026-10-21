@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/ddnsv2.sh -q
+ExecStart=/usr/local/bin/ddnsv2.sh -q -c /etc/ddns/ddns.conf
 StandardOutput=journal
 StandardError=journal
 
@@ -15,7 +15,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/log/ddns
+ReadWritePaths=/var/log/ddns /var/lock
 
 [Install]
 WantedBy=multi-user.target

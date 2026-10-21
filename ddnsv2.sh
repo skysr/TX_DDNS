@@ -64,12 +64,18 @@ set -e  # 遇到错误立即退出
 # 全局常量定义
 #-------------------------------------------------------------------------------
 
-readonly VERSION="2.3.0"                    # 脚本版本号
+readonly VERSION="2.4.0"                    # 脚本版本号
 readonly SCRIPT_NAME=$(basename "$0")        # 脚本名称
 
 # 脚本所在目录（用于定位配置文件）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/ddnsv2.conf"      # 默认配置文件路径
+# 默认配置文件路径：优先使用系统安装路径 /etc/ddns/ddns.conf，
+# 其次回退到脚本同目录的 ddnsv2.conf（便于源码目录直接运行）
+if [ -f "/etc/ddns/ddns.conf" ]; then
+    CONFIG_FILE="/etc/ddns/ddns.conf"
+else
+    CONFIG_FILE="${SCRIPT_DIR}/ddnsv2.conf"
+fi
 
 #-------------------------------------------------------------------------------
 # 默认配置值
@@ -120,7 +126,9 @@ cleanup() {
     if [ -f "$PID_FILE" ]; then
         local lock_pid=$(cat "$PID_FILE" 2>/dev/null)
         if [ "$lock_pid" = "$$" ]; then
-            rm -f "$PID_FILE" "$LOCK_FILE" 2>/dev/null || true
+            # LOCK_FILE 是目录（mkdir 原子锁），必须用 rm -rf，rm -f 删不掉目录
+            rm -f "$PID_FILE" 2>/dev/null || true
+            rm -rf "$LOCK_FILE" 2>/dev/null || true
         fi
     fi
 
@@ -215,7 +223,7 @@ parse_args() {
                 show_help
                 exit 0
                 ;;
-            status|test|history)
+            run|status|test|history)
                 command="$1"
                 shift
                 ;;
@@ -302,7 +310,7 @@ load_config() {
 
         # 只允许预定义的配置项（安全白名单）
         case "$key" in
-            LOGIN_TOKEN|DOMAIN_ID|RECORD_ID|SUB_DOMAIN|RECORD_TYPE|NETWORK_INTERFACE|LOG_DIR|FORCE_UPDATE_CYCLE|MAX_RETRY|RETRY_DELAY|RECORD_TTL|WEBHOOK_URL|WEBHOOK_METHOD|HISTORY_MAX)
+            LOGIN_TOKEN|DOMAIN_ID|RECORD_ID|SUB_DOMAIN|RECORD_TYPE|NETWORK_INTERFACE|LOG_DIR|LOCK_DIR|FORCE_UPDATE_CYCLE|MAX_RETRY|RETRY_DELAY|RECORD_TTL|WEBHOOK_URL|WEBHOOK_METHOD|WEBHOOK_CHAT_ID|HISTORY_MAX)
                 declare -g "$key=$value"
                 ;;
         esac
@@ -407,6 +415,12 @@ init_dirs() {
     PID_FILE="$LOCK_DIR/ddns.pid"           # PID 文件
     HISTORY_FILE="$LOG_DIR/history.log"     # 更新历史
 
+    # 锁目录可能已被上次异常退出残留，且 PID 文件已丢失——主动清理僵尸锁
+    if [ -d "$LOCK_FILE" ] && [ ! -f "$PID_FILE" ]; then
+        log_warn "发现残留锁目录（无 PID 文件），清理: $LOCK_FILE"
+        rm -rf "$LOCK_FILE" 2>/dev/null || true
+    fi
+
     # 初始化文件（如果不存在）
     [ -f "$DB_FILE" ] || touch "$DB_FILE"
     [ -f "$FLAG_FILE" ] || echo "0" > "$FLAG_FILE"
@@ -435,14 +449,17 @@ acquire_lock() {
         fi
 
         # 检查是否有旧进程在运行
-        if [ -f "$PID_FILE" ]; then
-            local old_pid=$(cat "$PID_FILE" 2>/dev/null)
-            # 检查进程是否存在（kill -0 不发送信号，只检查）
-            if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
-                log_warn "清理僵尸锁 (PID: $old_pid)"
-                rm -rf "$LOCK_FILE" "$PID_FILE" 2>/dev/null
-                continue
-            fi
+        # 注意：不能只依赖 PID 文件——PID 文件可能已被删除，此时仍需判断锁目录
+        # 是否为僵尸锁。用 /proc/<pid> 判断进程是否真实存在（不依赖 kill 权限）。
+        local old_pid=""
+        [ -f "$PID_FILE" ] && old_pid=$(cat "$PID_FILE" 2>/dev/null)
+
+        if [ -z "$old_pid" ] || [ ! -d "/proc/$old_pid" ]; then
+            # 无 PID 或 PID 对应进程已不存在 → 僵尸锁，安全清理
+            log_warn "清理僵尸锁 (PID: ${old_pid:-unknown})"
+            rm -rf "$LOCK_FILE" 2>/dev/null || true
+            rm -f "$PID_FILE" 2>/dev/null || true
+            continue
         fi
 
         # 检查超时
@@ -499,6 +516,20 @@ rotate_log() {
 check_network() {
     local attempts=3
     local timeout=3
+
+    # ping 可能未安装（精简容器/静态系统），此时退化为 curl 连通性探测
+    if ! command -v ping >/dev/null 2>&1; then
+        log_debug "ping 不可用，改用 curl 探测"
+        for ((i=1; i<=attempts; i++)); do
+            if curl -s -o /dev/null --connect-timeout "$timeout" https://dnsapi.cn 2>/dev/null; then
+                log_debug "网络检查通过 (curl)"
+                return 0
+            fi
+            [ $i -lt $attempts ] && sleep 1
+        done
+        log_error "网络不可用"
+        return 1
+    fi
 
     for ((i=1; i<=attempts; i++)); do
         # 尝试 IPv4：ping Google DNS
@@ -570,7 +601,14 @@ is_valid_ipv4() {
         local IFS='.'
         read -ra octets <<< "$ip"
         for octet in "${octets[@]}"; do
-            [ "$octet" -gt 255 ] && return 1
+            # 拒绝前导零（如 010），避免被当作八进制解析成 8，绕过范围校验
+            if [[ "$octet" =~ ^0[0-9] ]]; then
+                return 1
+            fi
+            # 10# 强制十进制解释
+            if [ "$((10#$octet))" -gt 255 ]; then
+                return 1
+            fi
         done
         return 0
     fi
@@ -663,6 +701,29 @@ get_public_ip() {
 #===============================================================================
 
 #-------------------------------------------------------------------------------
+# FUNCTION: urlencode
+# DESCRIPTION: 纯 bash 实现 URL 编码（不依赖 jq / python）
+# PARAMETERS: $1 - 原始字符串
+# OUTPUT: 百分号编码后的字符串
+#-------------------------------------------------------------------------------
+urlencode() {
+    local str="$1"
+    local out=""
+    local i ch
+    # 强制 C locale：否则 bash 按字符（而非字节）切分，UTF-8 多字节字符会被截断
+    local LC_ALL=C
+    for ((i=0; i<${#str}; i++)); do
+        ch="${str:i:1}"
+        case "$ch" in
+            [a-zA-Z0-9.~_-]) out+="$ch" ;;
+            ' ')             out+="%20" ;;
+            *)               out+="%"$(printf '%02X' "'$ch") ;;
+        esac
+    done
+    echo "$out"
+}
+
+#-------------------------------------------------------------------------------
 # FUNCTION: parse_json_field
 # DESCRIPTION: 从 JSON 字符串中提取指定字段的值
 #              使用纯 Bash 实现，避免依赖 jq
@@ -679,14 +740,53 @@ parse_json_field() {
     local field="$2"
     local value
 
-    # 尝试提取字符串值
-    value=$(echo "$json" | grep -oP "\"$field\"\s*:\s*\"[^\"]*\"" | \
-            sed 's/.*: *"\([^"]*\)".*/\1/' | head -1)
+    # DNSPod API v2 的响应是嵌套结构：{"status":{"code":1,"message":"操作成功"}}
+    # 优先从 status 对象里取，避免误取到 record 等其它层级同名字段
+    local status_block
+    status_block=$(printf '%s' "$json" | grep -oP '"status"\s*:\s*\{[^}]*\}' | head -1)
 
-    # 如果没有字符串值，尝试提取数值
+    if [ -n "$status_block" ]; then
+        value=$(printf '%s' "$status_block" | grep -oP "\"$field\"\s*:\s*\"[^\"]*\"" | \
+                sed 's/.*: *"\([^"]*\)".*/\1/' | head -1)
+        if [ -z "$value" ]; then
+            value=$(printf '%s' "$status_block" | grep -oP "\"$field\"\s*:\s*[0-9]+" | \
+                    sed 's/.*: *\([0-9]*\).*/\1/' | head -1)
+        fi
+    fi
+
+    # status 里没有则回退到全文档搜索
     if [ -z "$value" ]; then
-        value=$(echo "$json" | grep -oP "\"$field\"\s*:\s*[0-9]+" | \
-                sed 's/.*: *\([0-9]*\).*/\1/' | head -1)
+        # 尝试提取字符串值
+        value=$(printf '%s' "$json" | grep -oP "\"$field\"\s*:\s*\"[^\"]*\"" | \
+                sed 's/.*: *"\([^"]*\)".*/\1/' | head -1)
+
+        # 如果没有字符串值，尝试提取数值
+        if [ -z "$value" ]; then
+            value=$(printf '%s' "$json" | grep -oP "\"$field\"\s*:\s*[0-9]+" | \
+                    sed 's/.*: *\([0-9]*\).*/\1/' | head -1)
+        fi
+    fi
+
+    # 解码 \uXXXX 转义（部分 API 会返回转义后的中文）
+    # 用纯 bash 逐个替换：printf '%b' 会把 \x64 误当八进制，sed 的 \xNN 替换
+    # 在部分 sed 实现上也不可靠，故手工换算
+    if printf '%s' "$value" | grep -qP '\\u[0-9a-fA-F]{4}'; then
+        local decoded=""
+        local rest="$value"
+        while [[ "$rest" =~ \\u([0-9a-fA-F]{4})(.*) ]]; do
+            local hex="${BASH_REMATCH[1]}"
+            rest="${BASH_REMATCH[2]}"
+            local code=$((16#$hex))
+            # 按 UTF-8 编码该码点
+            if [ "$code" -lt 128 ]; then
+                decoded+=$(printf "\\$(printf '%03o' "$code")")
+            elif [ "$code" -lt 2048 ]; then
+                decoded+=$(printf "\\$(printf '%03o' $((0xC0 | (code >> 6))))\\$(printf '%03o' $((0x80 | (code & 0x3F))))")
+            else
+                decoded+=$(printf "\\$(printf '%03o' $((0xE0 | (code >> 12))))\\$(printf '%03o' $((0x80 | ((code >> 6) & 0x3F))))\\$(printf '%03o' $((0x80 | (code & 0x3F))))")
+            fi
+        done
+        value="$decoded$rest"
     fi
 
     echo "$value"
@@ -741,22 +841,34 @@ EOF
 )
             ;;
         *slack.com*)
-            # Slack Webhook 格式
+            # Slack Webhook 格式（Slack 接受纯 JSON body）
             local emoji=":white_check_mark:"
             [ "$status" = "error" ] && emoji=":x:"
-            payload="payload={\"text\":\"$emoji TX_DDNS: $message\nIP: $ip\n时间: $timestamp\"}"
-            ;;
-        *telegram.org*|*api.telegram.org*)
-            # Telegram Bot API 格式
-            local text="TX_DDNS 通知\n状态: $status\nIP: $ip\n时间: $timestamp\n$message"
-            if [[ "$WEBHOOK_URL" == *sendMessage* ]]; then
-                payload="chat_id=&text=$(echo "$text" | jq -sRr @uri)"
-            else
-                payload=$(cat <<EOF
-{"chat_id": "", "text": "$text"}
+            payload=$(cat <<EOF
+{"text":"$emoji TX_DDNS: $message\nIP: $ip\n时间: $timestamp"}
 EOF
 )
+            ;;
+        *telegram.org*)
+            # Telegram Bot API 格式
+            # 纯 bash URL 编码，不依赖 jq（README 声明无外部依赖）
+            local text="TX_DDNS 通知
+状态: $status
+IP: $ip
+时间: $timestamp
+$message"
+            local encoded
+            encoded=$(urlencode "$text")
+            # chat_id 优先取 WEBHOOK_CHAT_ID，未配置时从 URL 查询串解析 ?chat_id=xxx
+            local chat_id="${WEBHOOK_CHAT_ID:-}"
+            if [ -z "$chat_id" ]; then
+                chat_id=$(printf '%s' "$WEBHOOK_URL" | sed -n 's/.*[?&]chat_id=\([^&]*\).*/\1/p')
             fi
+            if [ -z "$chat_id" ]; then
+                log_warn "Telegram Webhook 缺少 chat_id，跳过发送"
+                return 0
+            fi
+            payload="chat_id=$(urlencode "$chat_id")&text=$encoded"
             ;;
         *)
             # 通用 JSON 格式
@@ -775,15 +887,22 @@ EOF
     esac
 
     # 发送 HTTP 请求
+    # Telegram 使用 form-urlencoded，其余平台使用 JSON
+    local content_type="application/json"
+    case "$WEBHOOK_URL" in
+        *telegram.org*) content_type="application/x-www-form-urlencoded" ;;
+    esac
+
     local response
+    local rc=0
     response=$(curl -s -X "$method" \
-        -H "Content-Type: application/json" \
+        -H "Content-Type: $content_type" \
         -d "$payload" \
         --connect-timeout 10 \
         --max-time 30 \
-        "$WEBHOOK_URL" 2>&1)
+        "$WEBHOOK_URL" 2>&1) || rc=$?
 
-    if [ $? -eq 0 ]; then
+    if [ "$rc" -eq 0 ]; then
         log_debug "Webhook 发送成功"
     else
         log_warn "Webhook 发送失败: $response"
@@ -885,7 +1004,7 @@ call_dns_api() {
             sleep $RETRY_DELAY
         fi
 
-        ((attempt++))
+        attempt=$((attempt + 1))
     done
 
     log_error "API 调用失败，已达最大重试次数"
@@ -984,7 +1103,7 @@ do_test() {
         echo "  网络正常"
     else
         echo "  ✗ 网络不可用"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # 测试 2: API Token 有效性
@@ -1000,7 +1119,7 @@ do_test() {
     else
         local message=$(parse_json_field "$response" "message")
         echo "  ✗ Token 无效: $message"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # 测试 3: 域名和记录访问权限
@@ -1021,7 +1140,7 @@ do_test() {
     else
         local message=$(parse_json_field "$response" "message")
         echo "  ✗ 无法访问记录: $message"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # 测试 4: IP 获取
@@ -1034,7 +1153,7 @@ do_test() {
             echo "  IPv6 获取成功: $current_ip"
         else
             echo "  ✗ 无法获取有效 IPv6: '$current_ip'"
-            ((errors++))
+            errors=$((errors + 1))
         fi
     else
         current_ip=$(get_current_ipv4)
@@ -1042,7 +1161,7 @@ do_test() {
             echo "  IPv4 获取成功: $current_ip"
         else
             echo "  ✗ 无法获取有效 IPv4: '$current_ip'"
-            ((errors++))
+            errors=$((errors + 1))
         fi
     fi
 
@@ -1053,7 +1172,7 @@ do_test() {
         echo "  日志目录可写"
     else
         echo "  ✗ 日志目录不可写: $LOG_DIR"
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # 测试 6: Webhook 可达性（可选）
@@ -1238,18 +1357,24 @@ main() {
 
     # 执行 DNS 更新
     log_info "正在更新 DNS 记录..."
-    safe_write "0" "$FLAG_FILE"           # 重置计数器
-    safe_write "$current_ip" "$DB_FILE"   # 保存新 IP
 
     # 调用 DNSPod API
-    local response=$(call_dns_api "$current_ip")
-    local exit_code=$?
+    # 注意：db/flag 必须在 API 成功后才落盘。若先写状态再调 API，API 失败时
+    # db 里已是新 IP、flag 已归零，下一轮会判定"IP 未变化"而跳过更新，
+    # 导致 DNS 永久停留在旧值。
+    local response
+    local exit_code=0
+    response=$(call_dns_api "$current_ip") || exit_code=$?
 
     local code=$(parse_json_field "$response" "code")
     local message=$(parse_json_field "$response" "message")
 
     # 处理更新结果
     if [ "$code" = "1" ]; then
+        # 成功后才写入状态：保存新 IP 并重置计数器
+        safe_write "$current_ip" "$DB_FILE"
+        safe_write "0" "$FLAG_FILE"
+
         log_info "更新成功: $SUB_DOMAIN -> $current_ip (TTL: $RECORD_TTL)"
         record_history "success" "${old_ip:-无}" "$current_ip" "$message"
         send_webhook "success" "$current_ip" "DNS 更新成功: $SUB_DOMAIN"
@@ -1259,6 +1384,7 @@ main() {
         if [ "$VERBOSE" -eq 1 ]; then
             log_error "API 响应: $response"
         fi
+        # 失败时保持 db/flag 原样，下一轮会重试
         record_history "error" "${old_ip:-无}" "${current_ip:-无}" "更新失败: $message"
         send_webhook "error" "${current_ip:-无}" "DNS 更新失败: $SUB_DOMAIN - $message"
         exit 1
