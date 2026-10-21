@@ -7,7 +7,21 @@
 # 获取方式: https://console.dnspod.cn/user/user/api
 LOGIN_TOKEN='xxxxxxxx,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 
-# 域名信息
+# ============ 记录配置 ============
+#
+# 两种模式二选一：
+#
+# 【多记录模式】设置 RECORDS_FILE，由记录列表文件定义所有记录
+#   RECORDS_FILE='/etc/ddns/records.list'
+#
+# 【单记录模式】不设 RECORDS_FILE 时，使用下面的 DOMAIN_ID/RECORD_ID/SUB_DOMAIN
+
+# 多记录模式：记录列表文件路径
+# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL   （详见 records.list.example）
+# 设置此项后，下面的 DOMAIN_ID/RECORD_ID/SUB_DOMAIN/RECORD_TYPE 不再生效
+RECORDS_FILE=''
+
+# 单记录模式：域名信息
 DOMAIN_ID='xxxxxxxxxxx'
 RECORD_ID='xxxxxxxxxxxx'
 SUB_DOMAIN='xxxxxx'

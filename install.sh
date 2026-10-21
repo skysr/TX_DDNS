@@ -20,6 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 安装路径
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/ddns"
+RECORDS_PATH="/etc/ddns/records.list"
 LOG_DIR="/var/log/ddns"
 SERVICE_DIR="/etc/systemd/system"
 
@@ -75,38 +76,76 @@ interactive_config() {
         exit 1
     fi
 
-    # 域名 ID
-    prompt "请输入域名 ID (domain_id): "
-    read -r DOMAIN_ID
-
-    # 记录 ID
-    prompt "请输入记录 ID (record_id): "
-    read -r RECORD_ID
-
-    # 子域名
-    prompt "请输入子域名 (如 www, 留空为 @): "
-    read -r SUB_DOMAIN
-    [ -z "$SUB_DOMAIN" ] && SUB_DOMAIN="@"
-
-    # 记录类型
-    echo ""
-    echo "记录类型:"
-    echo "  1) AAAA (IPv6) - 推荐"
-    echo "  2) A (IPv4)"
-    prompt "请选择 [1/2]: "
-    read -r record_choice
-
-    case "$record_choice" in
-        2) RECORD_TYPE="A";;
-        *) RECORD_TYPE="AAAA";;
-    esac
-
-    # 网卡
+    # 网卡（全局默认，单条记录可单独覆盖）
     echo ""
     echo "可用网卡:"
     ip -br link show | grep -v "lo" | awk '{print "  - "$1}'
-    prompt "请输入网卡名称 (留空自动检测): "
+    prompt "请输入网卡名称 (留空自动检测，作为默认值): "
     read -r NETWORK_INTERFACE
+
+    # ---- 收集记录列表 ----
+    RECORDS_LINES=()
+    RECORD_COUNT=0
+
+    echo ""
+    echo "=========================================="
+    echo "       记录配置（可添加多条）"
+    echo "=========================================="
+    echo ""
+    echo "每条记录需要: 子域名、域名ID、记录ID"
+    echo "  子域名: www / nas / @ (主域名) / * (泛解析)"
+    echo "  留空子域名则直接回车结束录入"
+    echo ""
+
+    while true; do
+        prompt "子域名 (留空结束): "
+        read -r sub
+        [ -z "$sub" ] && break
+
+        prompt "  域名 ID (domain_id): "
+        read -r domain
+
+        prompt "  记录 ID (record_id): "
+        read -r rid
+
+        if [ -z "$domain" ] || [ -z "$rid" ]; then
+            error "域名 ID 和记录 ID 不能为空，该条记录已跳过"
+            continue
+        fi
+
+        # 记录类型（默认 AAAA）
+        echo "  记录类型: 1) AAAA (IPv6, 推荐)  2) A (IPv4)"
+        prompt "  选择 [1/2]: "
+        read -r rchoice
+        case "$rchoice" in
+            2) rtype="A";;
+            *) rtype="AAAA";;
+        esac
+
+        # 单条记录的网卡与 TTL（留空则用全局值）
+        prompt "  网卡 (留空用默认 ${NETWORK_INTERFACE:-自动}): "
+        read -r riface
+        [ -z "$riface" ] && riface="$NETWORK_INTERFACE"
+
+        prompt "  TTL 秒数 (留空用默认 600): "
+        read -r rttl
+        [ -z "$rttl" ] && rttl=600
+        [[ "$rttl" =~ ^[0-9]+$ ]] && [ "$rttl" -ge 1 ] || rttl=600
+
+        RECORDS_LINES+=("${sub}|${domain}|${rid}|${rtype}|${riface}|${rttl}")
+        RECORD_COUNT=$((RECORD_COUNT + 1))
+        echo "  ✓ 已添加: ${sub} (${rtype})"
+        echo ""
+    done
+
+    if [ "$RECORD_COUNT" -eq 0 ]; then
+        error "至少需要配置一条记录"
+        exit 1
+    fi
+
+    # 用第一条记录填充兼容字段（单记录模式下生效）
+    # 记录行格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL
+    IFS='|' read -r SUB_DOMAIN DOMAIN_ID RECORD_ID RECORD_TYPE _ _ <<< "${RECORDS_LINES[0]}"
 
     # 更新间隔（分钟）
     prompt "更新间隔分钟数 [1]: "
@@ -135,12 +174,12 @@ interactive_config() {
     echo "=========================================="
     echo "配置摘要:"
     echo "  Token:          ${LOGIN_TOKEN%%,*}****"
-    echo "  域名 ID:        $DOMAIN_ID"
-    echo "  记录 ID:        $RECORD_ID"
-    echo "  子域名:         $SUB_DOMAIN"
-    echo "  记录类型:       $RECORD_TYPE"
-    echo "  网卡:           ${NETWORK_INTERFACE:-自动检测}"
-    echo "  TTL:            $RECORD_TTL 秒"
+    echo "  记录数量:       $RECORD_COUNT"
+    for line in "${RECORDS_LINES[@]}"; do
+        IFS='|' read -r s1 s2 s3 s4 s5 s6 <<< "$line"
+        echo "    - $s1 ($s4) 域名=$s2 记录=$s3 TTL=$s6 网卡=${s5:-自动}"
+    done
+    echo "  网卡默认值:     ${NETWORK_INTERFACE:-自动检测}"
     echo "  更新间隔:       每 ${INTERVAL} 分钟"
     echo "  Webhook:        ${WEBHOOK_URL:-未配置}"
     echo "=========================================="
@@ -148,12 +187,42 @@ interactive_config() {
 
     prompt "确认安装? [Y/n]: "
     read -r confirm
-    [[ "$confirm" =~ ^[Nn] ]] && { warn "安装已取消"; exit 0; }
+    # 注意：不能写成 [[ ... ]] && { ...; }，该表达式在条件为假时返回 1，
+    # 配合 set -e 会直接终止脚本（且不打印任何错误，看起来像静默退出）。
+    if [[ "$confirm" =~ ^[Nn] ]]; then
+        warn "安装已取消"
+        exit 0
+    fi
+}
+
+# 生成记录列表文件
+generate_records_file() {
+    cat > "$RECORDS_PATH" << EOF
+# TX_DDNS 记录列表
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+#
+# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL
+# 子域名可为 www / nas / @ (主域名) / * (泛解析)
+
+EOF
+    local line
+    for line in "${RECORDS_LINES[@]}"; do
+        echo "$line" >> "$RECORDS_PATH"
+    done
+    chmod 600 "$RECORDS_PATH"
+    info "记录列表已生成: $RECORDS_PATH ($RECORD_COUNT 条)"
 }
 
 # 生成配置文件
 generate_config() {
     mkdir -p "$CONFIG_DIR"
+
+    # 强制更新周期换算并夹紧到最小 1
+    FORCE_UPDATE_CYCLE=$(( (FORCE_INTERVAL + INTERVAL - 1) / INTERVAL ))
+    [ "$FORCE_UPDATE_CYCLE" -ge 1 ] || FORCE_UPDATE_CYCLE=1
+
+    # 先生成记录列表
+    generate_records_file
 
     cat > "$CONFIG_DIR/ddns.conf" << EOF
 # TX_DDNS 配置文件
@@ -162,7 +231,10 @@ generate_config() {
 # DNSPod API Token
 LOGIN_TOKEN='$LOGIN_TOKEN'
 
-# 域名信息
+# 记录列表（多记录模式）
+RECORDS_FILE='$RECORDS_PATH'
+
+# 以下为单记录模式的兼容字段，多记录模式下不生效
 DOMAIN_ID='$DOMAIN_ID'
 RECORD_ID='$RECORD_ID'
 SUB_DOMAIN='$SUB_DOMAIN'
@@ -183,7 +255,6 @@ LOG_DIR='$LOG_DIR'
 # 脚本每运行一次计数 +1，计数达到 FORCE_UPDATE_CYCLE 时强制重推一次。
 # 检查间隔 = INTERVAL 分钟，因此 N 分钟强制周期对应 N/INTERVAL 次检查。
 FORCE_UPDATE_CYCLE=$(( (FORCE_INTERVAL + INTERVAL - 1) / INTERVAL ))
-[ "$FORCE_UPDATE_CYCLE" -ge 1 ] || FORCE_UPDATE_CYCLE=1
 
 # Webhook 通知 (可选)
 WEBHOOK_URL='$WEBHOOK_URL'
@@ -205,6 +276,12 @@ install_script() {
 
     # 创建符号链接
     ln -sf "$INSTALL_DIR/ddnsv2.sh" /usr/local/bin/tx-ddns
+
+    # 安装配置模板
+    [ -f "$SCRIPT_DIR/ddnsv2.conf.example" ] && \
+        cp "$SCRIPT_DIR/ddnsv2.conf.example" "$CONFIG_DIR/ddnsv2.conf.example" 2>/dev/null || true
+    [ -f "$SCRIPT_DIR/records.list.example" ] && \
+        cp "$SCRIPT_DIR/records.list.example" "$CONFIG_DIR/records.list.example" 2>/dev/null || true
 
     info "脚本已安装: $INSTALL_DIR/ddnsv2.sh"
 }
@@ -324,6 +401,7 @@ uninstall() {
     systemctl daemon-reload
 
     warn "配置文件保留在: $CONFIG_DIR/ddns.conf"
+    warn "记录列表保留在: $RECORDS_PATH"
     warn "日志文件保留在: $LOG_DIR"
 
     info "卸载完成"

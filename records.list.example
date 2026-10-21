@@ -1,0 +1,26 @@
+# TX_DDNS 记录列表
+#
+# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL
+#
+# 字段说明:
+#   子域名     必填。www / nas / @ (主域名) / * (泛解析)
+#   域名ID     必填。DNSPod 控制台「域名管理」里的域名 ID
+#   记录ID     必填。DNSPod 控制台「解析记录」里的记录 ID
+#   记录类型   可选。A (IPv4) / AAAA (IPv6)，留空用配置文件里的 RECORD_TYPE
+#   网卡       可选。留空自动检测，或用配置文件的 NETWORK_INTERFACE
+#   TTL        可选。留空用配置文件的 RECORD_TTL
+#
+# 以 # 开头的行和空行会被忽略。
+#
+# 用法: 在 ddns.conf 中设置
+#   RECORDS_FILE='/etc/ddns/records.list'
+#
+# 注意: 设置 RECORDS_FILE 后，配置文件里的
+#       DOMAIN_ID / RECORD_ID / SUB_DOMAIN / RECORD_TYPE 不再生效。
+
+# ---- 示例 ----
+# www|12345678|87654321|AAAA|eth0|600
+# nas|12345678|87654322|AAAA||600
+# home|12345678|87654323|A||300
+# @|12345678|87654324|AAAA|eth0|600
+# *|12345678|87654325|AAAA|eth0|900
