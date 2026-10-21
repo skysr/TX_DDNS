@@ -64,7 +64,7 @@ set -e  # 遇到错误立即退出
 # 全局常量定义
 #-------------------------------------------------------------------------------
 
-readonly VERSION="2.5.0"                    # 脚本版本号
+readonly VERSION="2.6.0"                    # 脚本版本号
 readonly SCRIPT_NAME=$(basename "$0")        # 脚本名称
 
 # 脚本所在目录（用于定位配置文件）
@@ -104,6 +104,10 @@ CURRENT_REC_TYPE=""
 
 # history 命令的子域名过滤条件
 HISTORY_FILTER=""
+
+# records 命令参数
+RECORDS_TARGET=""
+RECORDS_GENERATE=0
 
 #-------------------------------------------------------------------------------
 # 默认配置值
@@ -251,13 +255,37 @@ parse_args() {
                 show_help
                 exit 0
                 ;;
-            run|status|test|history|list)
+            run|status|test|history|list|records)
                 command="$1"
                 shift
                 # history 支持按子域名过滤: ddnsv2.sh history www
                 if [ "$command" = "history" ] && [ $# -gt 0 ] && [[ "$1" != -* ]]; then
                     HISTORY_FILTER="$1"
                     shift
+                fi
+                # records 支持指定域名与 --generate: ddnsv2.sh records example.com --generate
+                # 全局选项 (-c/-v/-q) 仍由外层 case 处理，此处只取子命令自己的参数
+                if [ "$command" = "records" ]; then
+                    while [ $# -gt 0 ]; do
+                        case "$1" in
+                            --generate)
+                                RECORDS_GENERATE=1
+                                shift
+                                ;;
+                            -c|-v|-q|-V|-h|--verbose|--quiet|--config|--version|--help)
+                                # 全局选项：交回外层处理
+                                break
+                                ;;
+                            -*)
+                                log_error "未知选项: $1"
+                                exit 1
+                                ;;
+                            *)
+                                RECORDS_TARGET="$1"
+                                shift
+                                ;;
+                        esac
+                    done
                 fi
                 ;;
             *)
@@ -288,6 +316,7 @@ TX_DDNS v${VERSION} - DNSPod 动态 DNS 更新脚本
   test      测试配置，不实际更新 DNS
   history   显示更新历史记录
   list      列出已配置的记录
+  records   从 DNSPod 拉取域名的解析记录
 
 选项:
   -v, --verbose     详细输出模式
@@ -301,6 +330,8 @@ TX_DDNS v${VERSION} - DNSPod 动态 DNS 更新脚本
   $SCRIPT_NAME status       # 查看状态
   $SCRIPT_NAME test         # 测试配置
   $SCRIPT_NAME list         # 列出所有记录
+  $SCRIPT_NAME records example.com             # 查看域名的解析记录
+  $SCRIPT_NAME records example.com --generate  # 生成记录列表文件
   $SCRIPT_NAME history      # 查看历史
   $SCRIPT_NAME history www  # 只看 www 子域名的历史
   $SCRIPT_NAME -v           # 详细输出
@@ -473,7 +504,14 @@ load_records() {
             log_info "已加载 $REC_COUNT 条记录: $RECORDS_FILE"
             return 0
         fi
-        log_warn "记录文件为空或无有效记录: $RECORDS_FILE"
+        log_error "记录文件为空或无有效记录: $RECORDS_FILE"
+        return 1
+    fi
+
+    # 配置了记录文件但文件不存在
+    if [ -n "${RECORDS_FILE:-}" ]; then
+        log_error "记录文件不存在: $RECORDS_FILE"
+        log_error "可执行 '$SCRIPT_NAME records <域名> --generate' 自动生成"
         return 1
     fi
 
@@ -506,11 +544,19 @@ validate_config() {
 
     # 多记录模式下，记录信息来自 RECORDS_FILE，配置文件的
     # DOMAIN_ID/RECORD_ID/SUB_DOMAIN/RECORD_TYPE 不再必填
-    if [ -z "${RECORDS_FILE:-}" ] || [ ! -f "${RECORDS_FILE}" ]; then
+    if [ -z "${RECORDS_FILE:-}" ]; then
+        # 完全未配置记录文件 → 必须是单记录模式
         [ -z "$DOMAIN_ID" ] && missing+=("DOMAIN_ID")
         [ -z "$RECORD_ID" ] && missing+=("RECORD_ID")
         [ -z "$SUB_DOMAIN" ] && missing+=("SUB_DOMAIN")
         [ -z "$RECORD_TYPE" ] && missing+=("RECORD_TYPE")
+    elif [ ! -f "${RECORDS_FILE}" ]; then
+        # 配置了记录文件但文件不存在：允许运行（records --generate 可创建它），
+        # 但若同时提供了单记录字段则按单记录模式处理
+        if [ -z "$DOMAIN_ID" ] && [ -z "$SUB_DOMAIN" ]; then
+            log_warn "记录文件不存在: $RECORDS_FILE"
+            log_warn "可执行 '$SCRIPT_NAME records <域名> --generate' 自动生成"
+        fi
     fi
 
     if [ ${#missing[@]} -gt 0 ]; then
@@ -942,7 +988,10 @@ parse_json_field() {
     # DNSPod API v2 的响应是嵌套结构：{"status":{"code":1,"message":"操作成功"}}
     # 优先从 status 对象里取，避免误取到 record 等其它层级同名字段
     local status_block
-    status_block=$(printf '%s' "$json" | grep -oP '"status"\s*:\s*\{[^}]*\}' | head -1)
+    # 压成单行，避免格式化过的 JSON 因换行导致匹配失败
+    local flat
+    flat=$(printf '%s' "$json" | tr -d '\n\r' | tr -s ' ')
+    status_block=$(printf '%s' "$flat" | grep -oP '"status"\s*:\s*\{[^}]*\}' | head -1)
 
     if [ -n "$status_block" ]; then
         value=$(printf '%s' "$status_block" | grep -oP "\"$field\"\s*:\s*\"[^\"]*\"" | \
@@ -956,12 +1005,12 @@ parse_json_field() {
     # status 里没有则回退到全文档搜索
     if [ -z "$value" ]; then
         # 尝试提取字符串值
-        value=$(printf '%s' "$json" | grep -oP "\"$field\"\s*:\s*\"[^\"]*\"" | \
+        value=$(printf '%s' "$flat" | grep -oP "\"$field\"\s*:\s*\"[^\"]*\"" | \
                 sed 's/.*: *"\([^"]*\)".*/\1/' | head -1)
 
         # 如果没有字符串值，尝试提取数值
         if [ -z "$value" ]; then
-            value=$(printf '%s' "$json" | grep -oP "\"$field\"\s*:\s*[0-9]+" | \
+            value=$(printf '%s' "$flat" | grep -oP "\"$field\"\s*:\s*[0-9]+" | \
                     sed 's/.*: *\([0-9]*\).*/\1/' | head -1)
         fi
     fi
@@ -1131,7 +1180,8 @@ record_history() {
     local new_ip="$3"
     local message="$4"
     local sub="${5:-$SUB_DOMAIN}"
-    local rtype="${6:-$RECORD_TYPE}"
+    # 多记录模式下每条记录的类型不同，优先用当前记录的类型
+    local rtype="${6:-${CURRENT_REC_TYPE:-$RECORD_TYPE}}"
 
     [ ! -f "$HISTORY_FILE" ] && touch "$HISTORY_FILE"
 
@@ -1474,6 +1524,251 @@ do_list() {
 }
 
 #-------------------------------------------------------------------------------
+# FUNCTION: parse_domain_info
+# DESCRIPTION: 从 API 响应中提取域名信息
+# PARAMETERS: $1 - API 响应 JSON
+# OUTPUT: "域名ID|域名"
+#-------------------------------------------------------------------------------
+parse_domain_info() {
+    local json="$1"
+    local flat
+    flat=$(printf '%s' "$json" | tr -d '\n\r' | tr -s ' ')
+
+    local block
+    block=$(printf '%s' "$flat" | grep -oP '"domain"\s*:\s*\{[^}]*\}' | head -1)
+    if [ -z "$block" ]; then
+        echo "|"
+        return 1
+    fi
+
+    local did dname
+    did=$(printf '%s' "$block" | grep -oP '"id"\s*:\s*"?[^",}]*' | head -1 | sed 's/.*: *"*//')
+    dname=$(printf '%s' "$block" | grep -oP '"name"\s*:\s*"[^"]*"' | head -1 | sed 's/.*: *"\(.*\)"/\1/')
+    printf '%s|%s\n' "$did" "$dname"
+}
+
+#-------------------------------------------------------------------------------
+# FUNCTION: parse_json_records
+# DESCRIPTION: 解析 DNSPod Record.List 响应中的 records 数组
+#              逐条输出: 记录ID|子域名|类型|TTL
+#              纯 bash 实现，不依赖 jq
+# PARAMETERS: $1 - API 响应 JSON
+# OUTPUT: 每行一条 "id|name|type|ttl"
+#-------------------------------------------------------------------------------
+parse_json_records() {
+    local json="$1"
+
+    # 先把 JSON 压成单行，消除换行对正则的影响
+    # （DNSPod 返回紧凑 JSON，但格式化过的响应会导致 .* 不跨行而匹配失败）
+    local flat
+    flat=$(printf '%s' "$json" | tr -d '\n\r' | tr -s ' ')
+
+    # 提取 records 数组
+    local arr
+    arr=$(printf '%s' "$flat" | grep -oP '"records"\s*:\s*\[.*\]' | head -1)
+    if [ -z "$arr" ]; then
+        return 1
+    fi
+
+    # 按 },{ 切成多行，每行一个对象，再逐个提取字段
+    # 记录对象内部不含嵌套对象，{[^}]*} 可以安全匹配
+    local obj id nm ty ttl
+    while IFS= read -r obj; do
+        [ -z "$obj" ] && continue
+        id=$(printf '%s' "$obj" | grep -oP '"id"\s*:\s*"[^"]*"' | head -1 | sed 's/.*: *"\(.*\)"/\1/')
+        nm=$(printf '%s' "$obj" | grep -oP '"name"\s*:\s*"[^"]*"' | head -1 | sed 's/.*: *"\(.*\)"/\1/')
+        ty=$(printf '%s' "$obj" | grep -oP '"type"\s*:\s*"[^"]*"' | head -1 | sed 's/.*: *"\(.*\)"/\1/')
+        ttl=$(printf '%s' "$obj" | grep -oP '"ttl"\s*:\s*"[^"]*"' | head -1 | sed 's/.*: *"\(.*\)"/\1/')
+        [ -z "$id" ] && continue
+        printf '%s|%s|%s|%s\n' "$id" "$nm" "$ty" "$ttl"
+    done < <(printf '%s' "$arr" | sed 's/},{/}\n{/g' | grep -oP '\{[^{}]*\}')
+}
+
+#-------------------------------------------------------------------------------
+# FUNCTION: fetch_records
+# DESCRIPTION: 调用 DNSPod Record.List 获取域名下的解析记录
+# PARAMETERS:
+#   $1 - 域名或域名 ID
+# OUTPUT: API 响应 JSON
+#-------------------------------------------------------------------------------
+fetch_records() {
+    local target="$1"
+
+    curl -s -X POST https://dnsapi.cn/Record.List \
+        -d "login_token=$LOGIN_TOKEN" \
+        -d "format=json" \
+        -d "domain=$target" \
+        --connect-timeout 10 \
+        --max-time 30 2>&1
+}
+
+#-------------------------------------------------------------------------------
+# FUNCTION: do_records
+# DESCRIPTION: 执行 records 命令
+#              从 DNSPod 拉取域名下的真实解析记录，列出可更新的记录
+#              并可生成记录列表文件（省去手工抄写域名ID/记录ID）
+# PARAMETERS: $1 - 域名（可选）
+# RETURNS: 成功返回 0，失败返回 1
+#-------------------------------------------------------------------------------
+do_records() {
+    load_config
+    init_dirs
+
+    local domain="${1:-}"
+
+    if [ -z "$domain" ]; then
+        # 未指定域名：尝试用配置里的 DOMAIN_ID
+        if [ -n "${DOMAIN_ID:-}" ]; then
+            domain="$DOMAIN_ID"
+        else
+            echo "用法: $SCRIPT_NAME records <域名>"
+            echo "  示例: $SCRIPT_NAME records example.com"
+            return 1
+        fi
+    fi
+
+    echo "正在获取 $domain 的解析记录..."
+    local response
+    response=$(fetch_records "$domain")
+
+    local code=$(parse_json_field "$response" "code")
+    if [ "$code" != "1" ]; then
+        local message=$(parse_json_field "$response" "message")
+        echo "✗ 获取记录失败: ${message:-未知错误}"
+        return 1
+    fi
+
+    # 域名信息
+    local dom_info
+    dom_info=$(parse_domain_info "$response")
+    local domain_id="${dom_info%%|*}"
+    local real_domain="${dom_info##*|}"
+
+    echo ""
+    echo "域名: ${real_domain:-$domain} (ID: ${domain_id:-未知})"
+    echo ""
+
+    # 解析记录
+    local entries
+    entries=$(parse_json_records "$response")
+    if [ -z "$entries" ]; then
+        echo "该域名下没有解析记录"
+        return 1
+    fi
+
+    echo "可更新的记录（A / AAAA 类型）:"
+    echo ""
+    printf "%-4s | %-16s | %-6s | %-12s | %s\n" "序号" "子域名" "类型" "记录ID" "TTL"
+    echo "----------------------------------------------------------------------"
+
+    local idx=0
+    local id nm ty ttl
+    local usable=""
+    while IFS='|' read -r id nm ty ttl; do
+        [ -z "$id" ] && continue
+        idx=$((idx + 1))
+        if [ "$ty" = "A" ] || [ "$ty" = "AAAA" ]; then
+            printf "%-4s | %-16s | %-6s | %-12s | %s\n" "$idx" "$nm" "$ty" "$id" "$ttl"
+            usable+="${nm}|${domain_id}|${id}|${ty}||${ttl}"$'\n'
+        else
+            printf "%-4s | %-16s | %-6s | %-12s | %s\n" "$idx" "$nm" "$ty" "$id" "$ttl"
+        fi
+    done <<< "$entries"
+
+    echo ""
+    echo "共计 $idx 条记录（其中 A/AAAA 类型可用于 DDNS）"
+
+    # 提示如何生成记录列表
+    if [ -n "$usable" ]; then
+        echo ""
+        echo "生成记录列表文件请执行:"
+        echo "  $SCRIPT_NAME records $domain --generate"
+    fi
+
+    return 0
+}
+
+#-------------------------------------------------------------------------------
+# FUNCTION: do_records_generate
+# DESCRIPTION: 从 DNSPod 拉取记录并生成记录列表文件
+# PARAMETERS: $1 - 域名
+# RETURNS: 成功返回 0，失败返回 1
+#-------------------------------------------------------------------------------
+do_records_generate() {
+    load_config
+    init_dirs
+
+    local domain="$1"
+    local outfile="${2:-$RECORDS_FILE}"
+
+    if [ -z "$domain" ]; then
+        echo "用法: $SCRIPT_NAME records <域名> --generate"
+        return 1
+    fi
+    if [ -z "$outfile" ]; then
+        echo "✗ 未指定输出文件（请在配置中设置 RECORDS_FILE）"
+        return 1
+    fi
+
+    echo "正在获取 $domain 的解析记录..."
+    local response
+    response=$(fetch_records "$domain")
+
+    local code=$(parse_json_field "$response" "code")
+    if [ "$code" != "1" ]; then
+        echo "✗ 获取记录失败: $(parse_json_field "$response" "message")"
+        return 1
+    fi
+
+    local dom_info
+    dom_info=$(parse_domain_info "$response")
+    local domain_id="${dom_info%%|*}"
+
+    local entries
+    entries=$(parse_json_records "$response")
+
+    # 只保留 A / AAAA
+    local lines=""
+    local count=0
+    local id nm ty ttl
+    while IFS='|' read -r id nm ty ttl; do
+        [ -z "$id" ] && continue
+        if [ "$ty" = "A" ] || [ "$ty" = "AAAA" ]; then
+            lines+="${nm}|${domain_id}|${id}|${ty}||${ttl}"$'\n'
+            count=$((count + 1))
+        fi
+    done <<< "$entries"
+
+    if [ "$count" -eq 0 ]; then
+        echo "✗ 没有找到 A / AAAA 类型的记录"
+        return 1
+    fi
+
+    # 备份已有文件
+    if [ -f "$outfile" ]; then
+        cp "$outfile" "${outfile}.bak.$(date +%Y%m%d%H%M%S)"
+        echo "已备份原文件: ${outfile}.bak.$(date +%Y%m%d%H%M%S)"
+    fi
+
+    {
+        echo "# TX_DDNS 记录列表"
+        echo "# 自动生成: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# 来源: DNSPod Record.List ($domain)"
+        echo "#"
+        echo "# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL"
+        echo ""
+        printf '%s' "$lines"
+    } > "$outfile"
+
+    chmod 600 "$outfile"
+    echo ""
+    echo "✓ 已生成 $outfile（$count 条记录）"
+    echo ""
+    echo "查看: $SCRIPT_NAME list -c \$CONFIG_FILE"
+    return 0
+}
+
+#-------------------------------------------------------------------------------
 # FUNCTION: do_history
 # DESCRIPTION: 执行 history 命令，显示 DNS 更新历史记录
 #-------------------------------------------------------------------------------
@@ -1708,6 +2003,14 @@ main() {
             ;;
         list)
             do_list
+            exit $?
+            ;;
+        records)
+            if [ "$RECORDS_GENERATE" -eq 1 ]; then
+                do_records_generate "$RECORDS_TARGET"
+            else
+                do_records "$RECORDS_TARGET"
+            fi
             exit $?
             ;;
     esac

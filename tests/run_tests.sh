@@ -363,9 +363,128 @@ else
 fi
 
 #-------------------------------------------------------------------------------
-# 测试 16: 语法检查
+# 测试 16: 记录发现（Record.List 解析）
 #-------------------------------------------------------------------------------
-head2 "测试 16: 语法检查"
+head2 "测试 16: 记录发现"
+sed -n '/^parse_json_records()/,/^}/p' "$DDNS" > "$TMPROOT/pjr.sh"
+cat > "$TMPROOT/sample.json" <<'JSONEOF'
+{"status":{"code":1,"message":"ok"},"domain":{"id":"12600793","name":"example.com"},
+ "records":[
+ {"id":"13608148","name":"www","line":"默认","type":"A","ttl":"600","value":"1.1.1.1"},
+ {"id":"13608149","name":"www","line":"电信","type":"AAAA","ttl":"600","value":"2404::1"},
+ {"id":"13608150","name":"nas","line":"默认","type":"A","ttl":"300","value":"1.1.1.2"},
+ {"id":"13608151","name":"@","line":"默认","type":"MX","ttl":"600","value":"mail.x.com"}
+]}
+JSONEOF
+OUT=$(bash -c "source '$TMPROOT/pjr.sh'; parse_json_records \"\$(cat '$TMPROOT/sample.json')\"" 2>&1)
+# 上面的双引号嵌套在部分 shell 下不可靠，改用 stdin 方式再验一次
+cat > "$TMPROOT/pjr_run.sh" <<'PJREOF'
+source "$1"
+parse_json_records "$(cat "$2")"
+PJREOF
+OUT=$(bash "$TMPROOT/pjr_run.sh" "$TMPROOT/pjr.sh" "$TMPROOT/sample.json" 2>&1)
+COUNT=$(printf '%s' "$OUT" | grep -c .)
+if [ "$COUNT" -eq 4 ]; then
+    ok "解析出 4 条记录"
+else
+    bad "记录解析数量不对" "期望 4，实际 $COUNT"
+fi
+if printf '%s' "$OUT" | grep -q "^13608148|www|A|600$"; then
+    ok "记录字段解析正确（id|name|type|ttl）"
+else
+    bad "记录字段解析错误" "$OUT"
+fi
+if printf '%s' "$OUT" | grep -q "^13608151|@|MX|600$"; then
+    ok "主域名 @ 与 MX 类型解析正确"
+else
+    bad "@ / MX 解析错误"
+fi
+
+# 格式化过的 JSON（带换行）必须也能解析
+# 真实 DNSPod 返回紧凑 JSON，但格式化过的响应会让 .* 不跨行而匹配失败
+cat > "$TMPROOT/sample_pretty.json" <<'JSONEOF'
+{
+  "status": {
+    "code": 1,
+    "message": "ok"
+  },
+  "domain": {
+    "id": "12600793",
+    "name": "example.com"
+  },
+  "records": [
+    {
+      "id": "13608148",
+      "name": "www",
+      "type": "A",
+      "ttl": "600"
+    }
+  ]
+}
+JSONEOF
+OUTP=$(bash "$TMPROOT/pjr_run.sh" "$TMPROOT/pjr.sh" "$TMPROOT/sample_pretty.json" 2>&1)
+if printf '%s' "$OUTP" | grep -q "^13608148|www|A|600$"; then
+    ok "格式化过的 JSON（含换行）也能正确解析"
+else
+    bad "格式化 JSON 解析失败" "$OUTP"
+fi
+
+# parse_json_field 也必须能处理格式化 JSON
+sed -n '/^parse_json_field()/,/^}/p' "$DDNS" > "$TMPROOT/pf2.sh"
+cat > "$TMPROOT/pf2_run.sh" <<'PF2EOF'
+source "$1"
+parse_json_field "$(cat "$2")" "code"
+PF2EOF
+CODER=$(bash "$TMPROOT/pf2_run.sh" "$TMPROOT/pf2.sh" "$TMPROOT/sample_pretty.json" 2>&1)
+if [ "$CODER" = "1" ]; then
+    ok "parse_json_field 处理格式化 JSON"
+else
+    bad "parse_json_field 无法处理格式化 JSON" "得到: $CODER"
+fi
+
+# 无 records 数组时应返回非零
+OUT2=$(bash -c "source '$TMPROOT/pjr.sh'; parse_json_records '{\"status\":{\"code\":1}}'" 2>&1)
+if [ -z "$OUT2" ]; then
+    ok "无 records 数组时返回空"
+else
+    bad "无 records 数组时应返回空" "$OUT2"
+fi
+
+# records 命令必须存在且 --generate 被支持
+if grep -q 'records)' "$DDNS" && grep -q 'RECORDS_GENERATE' "$DDNS"; then
+    ok "records 命令与 --generate 选项已实现"
+else
+    bad "records 命令未正确实现"
+fi
+# -c 等全局选项不能被子命令吞掉：records 的参数循环遇到全局选项必须 break
+if grep -qE '\-c\|\-v\|\-q\|\-V\|\-h\|\-\-verbose' "$DDNS"; then
+    ok "子命令参数解析不吞掉全局选项"
+else
+    bad "子命令会吞掉全局选项（-c 无法在子命令后使用）"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 17: 历史记录包含正确的记录类型
+#-------------------------------------------------------------------------------
+head2 "测试 17: 历史记录类型"
+# 多记录模式下每条记录类型不同，history 的类型列必须来自当前记录
+# 而非全局 RECORD_TYPE（多记录模式下为空）
+if grep -q 'local rtype="${6:-${CURRENT_REC_TYPE:-$RECORD_TYPE}}"' "$DDNS"; then
+    ok "record_history 从当前记录取类型"
+else
+    bad "record_history 未从当前记录取类型（多记录模式下类型列为空）"
+fi
+# 当前记录类型必须在 process_record 中赋值
+if grep -q 'CURRENT_REC_TYPE="\$rtype"' "$DDNS"; then
+    ok "process_record 设置当前记录类型"
+else
+    bad "process_record 未设置 CURRENT_REC_TYPE"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 18: 语法检查
+#-------------------------------------------------------------------------------
+head2 "测试 18: 语法检查"
 if bash -n "$DDNS" 2>/dev/null; then
     ok "ddnsv2.sh 语法正确"
 else
