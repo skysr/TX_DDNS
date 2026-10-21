@@ -622,9 +622,90 @@ else
 fi
 
 #-------------------------------------------------------------------------------
-# 测试 20: 语法检查
+# 测试 20: 凭据不进入进程命令行
 #-------------------------------------------------------------------------------
-head2 "测试 20: 语法检查"
+head2 "测试 20: 凭据保护"
+# API 调用必须经 stdin 传参（api_post），不能把 token 放进 curl 的 argv
+# 精确判定：curl 的 -d/--data 参数里不能出现 login_token
+if grep -E '\-\-?data[= ]+"?login_token' "$DDNS" | grep -q .; then
+    bad "仍有 API 调用把 login_token 直接放进 curl 参数（会出现在 ps 输出中）"
+else
+    ok "API 调用不再把 login_token 放进 curl 参数"
+fi
+# 也不应出现 -d "login_token=..." 形式
+if grep -E '\-d "?login_token=' "$DDNS" | grep -q .; then
+    bad "仍存在 -d login_token=... 形式"
+else
+    ok "不存在 -d login_token=... 形式"
+fi
+# api_post 必须存在且用 --data-binary @-
+if grep -q 'api_post() {' "$DDNS" && grep -q '\-\-data-binary @-' "$DDNS"; then
+    ok "api_post 通过 stdin 传递凭据"
+else
+    bad "缺少 api_post 或未使用 --data-binary @-"
+fi
+# API 基础地址应集中定义
+if grep -q 'readonly API_BASE_URL=' "$DDNS"; then
+    ok "API 基础地址集中定义为常量"
+else
+    bad "API 基础地址仍硬编码在多处"
+fi
+# 硬编码的 dnsapi.cn 只应出现在常量定义处
+HARD=$(grep -c 'dnsapi\.cn' "$DDNS")
+if [ "$HARD" -le 1 ]; then
+    ok "dnsapi.cn 仅出现 $HARD 次（常量定义）"
+else
+    bad "dnsapi.cn 仍出现 $HARD 次"
+fi
+
+# 实测：token 不应出现在 curl 进程的 cmdline 中
+cat > "$TMPROOT/probe.sh" <<'PROBEEOF'
+# 模拟 api_post 的调用方式，检测 token 是否进入 argv
+V="$1"
+urlencode() {
+    local str="$1"; local out="" local i ch
+    local LC_ALL=C
+    for ((i=0; i<${#str}; i++)); do
+        ch="${str:i:1}"
+        case "$ch" in
+            [a-zA-Z0-9.~_-]) out+="$ch" ;;
+            ' ')             out+="%20" ;;
+            *)               out+="%"$(printf '%02X' "'$ch") ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+printf 'login_token=%s&format=json' "$(urlencode "$TOKEN")" | \
+  curl -s -X POST "http://127.0.0.1:1/never" --data-binary @- \
+  -H 'Content-Type: application/x-www-form-urlencoded' >/dev/null 2>&1
+PROBEEOF
+export TOKEN="SECRETTOKENVALUE"
+bash "$TMPROOT/probe.sh" "test" &
+PROBE_PID=$!
+LEAK=0
+for _ in $(seq 1 30); do
+    for pid in /proc/[0-9]*; do
+        if [ -r "$pid/cmdline" ] 2>/dev/null; then
+            if tr '\0' ' ' < "$pid/cmdline" 2>/dev/null | grep -q "SECRETTOKENVALUE"; then
+                LEAK=1
+                break 2
+            fi
+        fi
+    done
+    sleep 0.02
+done
+wait $PROBE_PID 2>/dev/null
+if [ "$LEAK" -eq 0 ]; then
+    ok "token 不出现在任何进程的 cmdline 中"
+else
+    bad "token 出现在进程 cmdline 中"
+fi
+unset TOKEN
+
+#-------------------------------------------------------------------------------
+# 测试 21: 语法检查
+#-------------------------------------------------------------------------------
+head2 "测试 21: 语法检查"
 if bash -n "$DDNS" 2>/dev/null; then
     ok "ddnsv2.sh 语法正确"
 else

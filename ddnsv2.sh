@@ -65,6 +65,7 @@ set -e  # 遇到错误立即退出
 #-------------------------------------------------------------------------------
 
 readonly VERSION="2.6.0"                    # 脚本版本号
+readonly API_BASE_URL="https://dnsapi.cn"    # DNSPod API 基础地址
 readonly SCRIPT_NAME=$(basename "$0")        # 脚本名称
 
 # 脚本所在目录（用于定位配置文件）
@@ -783,7 +784,7 @@ check_network() {
     if ! command -v ping >/dev/null 2>&1; then
         log_debug "ping 不可用，改用 curl 探测"
         for ((i=1; i<=attempts; i++)); do
-            if curl -s -o /dev/null --connect-timeout "$timeout" https://dnsapi.cn 2>/dev/null; then
+            if curl -s -o /dev/null --connect-timeout "$timeout" "$API_BASE_URL" 2>/dev/null; then
                 log_debug "网络检查通过 (curl)"
                 return 0
             fi
@@ -1246,18 +1247,16 @@ call_dns_api() {
 
         # 调用 DNSPod Record.Modify API
         # 文档: https://docs.dnspod.cn/api/record_modify/
-        response=$(curl -s -X POST https://dnsapi.cn/Record.Modify \
-            -d "login_token=$LOGIN_TOKEN" \
-            -d "format=json" \
-            -d "domain_id=$api_domain" \
-            -d "record_id=$api_record" \
-            -d "record_line_id=0" \
-            -d "sub_domain=$api_sub" \
-            -d "value=$value" \
-            -d "record_type=$api_type" \
-            -d "ttl=$api_ttl" \
-            --connect-timeout 10 \
-            --max-time 30 2>&1)
+        response=$(api_post "Record.Modify" \
+            "login_token=$LOGIN_TOKEN" \
+            "format=json" \
+            "domain_id=$api_domain" \
+            "record_id=$api_record" \
+            "record_line_id=0" \
+            "sub_domain=$api_sub" \
+            "value=$value" \
+            "record_type=$api_type" \
+            "ttl=$api_ttl")
 
         code=$(parse_json_field "$response" "code")
         message=$(parse_json_field "$response" "message")
@@ -1402,8 +1401,9 @@ do_test() {
     echo ""
     echo "✓ 测试 API Token..."
     local response
-    response=$(curl -s -X POST https://dnsapi.cn/Info.Version \
-        -d "login_token=$LOGIN_TOKEN&format=json" 2>&1)
+    response=$(api_post "Info.Version" \
+        "login_token=$LOGIN_TOKEN" \
+        "format=json")
 
     local code=$(parse_json_field "$response" "code")
     if [ "$code" = "1" ]; then
@@ -1431,8 +1431,11 @@ do_test() {
             echo "✓ 测试记录 $((idx + 1))/$REC_COUNT: $sub ($rtype)"
 
             # 域名和记录访问权限
-            response=$(curl -s -X POST https://dnsapi.cn/Record.Info \
-                -d "login_token=$LOGIN_TOKEN&format=json&domain_id=${REC_DOMAIN[$idx]}&record_id=${REC_ID[$idx]}" 2>&1)
+            response=$(api_post "Record.Info" \
+                "login_token=$LOGIN_TOKEN" \
+                "format=json" \
+                "domain_id=${REC_DOMAIN[$idx]}" \
+                "record_id=${REC_ID[$idx]}")
 
             code=$(parse_json_field "$response" "code")
             if [ "$code" = "1" ]; then
@@ -1565,6 +1568,40 @@ parse_domain_info() {
 }
 
 #-------------------------------------------------------------------------------
+# FUNCTION: api_post
+# DESCRIPTION: 调用 DNSPod API
+#
+#              凭据只经 stdin 传给 curl，不出现在进程命令行（argv）里。
+#              否则 `ps aux` / /proc/<pid>/cmdline 能看到 login_token，
+#              任何本机用户都能读到 DNSPod API 凭据。
+#
+# PARAMETERS:
+#   $1 - 接口路径（如 Record.Modify）
+#   $2... - 表单参数（key=value 形式，值需自行 URL 编码）
+# OUTPUT: API 响应
+#-------------------------------------------------------------------------------
+api_post() {
+    local endpoint="$1"
+    shift
+
+    # 用 printf 构造 body，值逐个 URL 编码后经管道交给 curl
+    local body=""
+    local kv key value
+    for kv in "$@"; do
+        key="${kv%%=*}"
+        value="${kv#*=}"
+        [ -n "$body" ] && body+="&"
+        body+="${key}=$(urlencode "$value")"
+    done
+
+    printf '%s' "$body" | curl -s -X POST "${API_BASE_URL}/${endpoint}" \
+        --data-binary @- \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --connect-timeout 10 \
+        --max-time 30 2>&1
+}
+
+#-------------------------------------------------------------------------------
 # FUNCTION: parse_json_records
 # DESCRIPTION: 解析 DNSPod Record.List 响应中的 records 数组
 #              逐条输出: 记录ID|子域名|类型|TTL
@@ -1611,12 +1648,10 @@ parse_json_records() {
 fetch_records() {
     local target="$1"
 
-    curl -s -X POST https://dnsapi.cn/Record.List \
-        -d "login_token=$LOGIN_TOKEN" \
-        -d "format=json" \
-        -d "domain=$target" \
-        --connect-timeout 10 \
-        --max-time 30 2>&1
+    api_post "Record.List" \
+        "login_token=$LOGIN_TOKEN" \
+        "format=json" \
+        "domain=$target"
 }
 
 #-------------------------------------------------------------------------------
