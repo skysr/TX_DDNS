@@ -18,6 +18,7 @@
 #         - 自动检测本地 IPv4/IPv6 地址变化
 #         - 支持 DNSPod API 更新 DNS 记录
 #         - 支持多网卡指定（NETWORK_INTERFACE）
+#         - 支持固定公网 IPv6 地址（IP_ADDRESS / 记录列表第 7 字段，仅 IPv6）
 #         - 支持强制周期更新（防止 DNS 记录过期）
 #         - 支持 Webhook 通知（Discord/Slack/Telegram/自定义）
 #         - 完善的日志记录和历史追踪
@@ -51,10 +52,15 @@
 #
 #   SUB_DOMAIN      - 子域名，如 "www"、"@"（主域名）、"*"（泛解析）
 #
-#   RECORD_TYPE     - 记录类型，支持 "A" (IPv4) 或 "AAAA" (IPv6)
+#   RECORD_TYPE     - 记录类型，固定为 "AAAA" (IPv6，本工具只支持 IPv6；留空默认 AAAA)
 #
 #   NETWORK_INTERFACE - 可选，指定网卡名称，如 "eth0"、"ens33"
 #                       不填则自动选择第一个公网 IP
+#
+#   IP_ADDRESS        - 可选，固定 IPv6 地址（全局默认，仅支持 IPv6）
+#                       填写后直接以此地址更新 DNS，不做网卡检测。
+#                       多记录模式下每条记录可用记录列表第 7 字段 (IP) 单独覆盖。
+#                       A (IPv4) 记录不支持固定地址，只能用网卡自动检测。
 #
 #===============================================================================
 
@@ -64,7 +70,7 @@ set -e  # 遇到错误立即退出
 # 全局常量定义
 #-------------------------------------------------------------------------------
 
-readonly VERSION="2.6.0"                    # 脚本版本号
+readonly VERSION="2.7.0"                    # 脚本版本号
 readonly SCRIPT_NAME=$(basename "$0")        # 脚本名称
 
 # 脚本所在目录（用于定位配置文件）
@@ -80,11 +86,12 @@ fi
 #-------------------------------------------------------------------------------
 # 记录列表（多记录模式）
 #
-# 每条记录由 6 个字段组成，以 "|" 分隔：
-#   子域名|域名ID|记录ID|记录类型|网卡|TTL
+# 每条记录由 7 个字段组成，以 "|" 分隔：
+#   子域名|域名ID|记录ID|记录类型|网卡|TTL|IP
 #
 # 子域名可为 www / @ (主域名) / * (泛解析)
-# 后三个字段留空时回退到全局配置
+# 后四个字段留空时回退到全局配置
+# （IP 留空 = 按网卡自动检测；填了 = 固定该地址，直接推送）
 #
 # 统一用并行数组存储，索引即记录编号
 #-------------------------------------------------------------------------------
@@ -94,6 +101,7 @@ declare -a REC_ID=()         # 记录 ID
 declare -a REC_TYPE=()       # 记录类型 (A/AAAA)
 declare -a REC_IFACE=()      # 网卡
 declare -a REC_TTL=()        # TTL
+declare -a REC_IP=()         # 固定 IP（记录第 7 字段 > 全局 IP_ADDRESS，空 = 自动检测）
 REC_COUNT=0                 # 记录总数
 
 # 每条记录的状态文件后缀（用于隔离 db/flag）
@@ -377,7 +385,7 @@ load_config() {
 
         # 只允许预定义的配置项（安全白名单）
         case "$key" in
-            LOGIN_TOKEN|DOMAIN_ID|RECORD_ID|SUB_DOMAIN|RECORD_TYPE|NETWORK_INTERFACE|LOG_DIR|LOCK_DIR|FORCE_UPDATE_CYCLE|MAX_RETRY|RETRY_DELAY|RECORD_TTL|WEBHOOK_URL|WEBHOOK_METHOD|WEBHOOK_CHAT_ID|HISTORY_MAX|RECORDS_FILE)
+            LOGIN_TOKEN|DOMAIN_ID|RECORD_ID|SUB_DOMAIN|RECORD_TYPE|NETWORK_INTERFACE|IP_ADDRESS|LOG_DIR|LOCK_DIR|FORCE_UPDATE_CYCLE|MAX_RETRY|RETRY_DELAY|RECORD_TTL|WEBHOOK_URL|WEBHOOK_METHOD|WEBHOOK_CHAT_ID|HISTORY_MAX|RECORDS_FILE)
                 declare -g "$key=$value"
                 ;;
         esac
@@ -422,13 +430,13 @@ record_key() {
 parse_record_line() {
     local line="$1"
 
-    # 按 | 分割，最多 6 段
-    IFS='|' read -r sub domain rid rtype iface ttl extra <<< "$line"
+    # 按 | 分割，最多 7 段
+    IFS='|' read -r sub domain rid rtype iface ttl ip extra <<< "$line"
 
-    # 第 7 段说明格式错误
+    # 第 8 段说明格式错误
     if [ -n "${extra:-}" ]; then
         log_error "记录格式错误（字段过多）: $line"
-        log_error "正确格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL"
+        log_error "正确格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL|IP"
         return 1
     fi
 
@@ -438,14 +446,14 @@ parse_record_line() {
         return 1
     fi
 
-    # 后三个字段回退到全局配置
-    [ -z "${rtype:-}" ] && rtype="$RECORD_TYPE"
+    # 后三个字段回退到全局配置（类型留空默认 AAAA，本工具只支持 IPv6）
+    [ -z "${rtype:-}" ] && rtype="AAAA"
     [ -z "${iface:-}" ] && iface="$NETWORK_INTERFACE"
     [ -z "${ttl:-}" ] && ttl="$RECORD_TTL"
 
-    # 校验记录类型
-    if [[ ! "$rtype" =~ ^(A|AAAA)$ ]]; then
-        log_error "记录类型必须是 A 或 AAAA: $line"
+    # 校验记录类型：只支持 AAAA (IPv6)
+    if [ "$rtype" != "AAAA" ]; then
+        log_error "本工具只支持 IPv6 (AAAA) 记录: $line"
         return 1
     fi
 
@@ -455,6 +463,20 @@ parse_record_line() {
         return 1
     fi
 
+    # 固定 IP（仅支持 IPv6）：记录第 7 字段 > 全局 IP_ADDRESS，留空则自动检测
+    [ -z "${ip:-}" ] && ip="${IP_ADDRESS:-}"
+    if [ -n "$ip" ]; then
+        if [ "$rtype" = "AAAA" ]; then
+            if ! is_valid_ipv6 "$ip"; then
+                log_error "固定的 IPv6 地址无效: $ip (行: $line)"
+                return 1
+            fi
+        else
+            log_error "IP 字段只支持 IPv6 地址，A 记录请使用网卡自动检测: $line"
+            return 1
+        fi
+    fi
+
     # 追加到数组
     REC_SUB+=("$sub")
     REC_DOMAIN+=("$domain")
@@ -462,10 +484,11 @@ parse_record_line() {
     REC_TYPE+=("$rtype")
     REC_IFACE+=("$iface")
     REC_TTL+=("$ttl")
+    REC_IP+=("$ip")
     REC_KEY+=("$(record_key "$sub" "$rtype" "$domain")")
     REC_COUNT=$((REC_COUNT + 1))
 
-    log_debug "加载记录 $REC_COUNT: $sub ($rtype) domain=$domain id=$rid"
+    log_debug "加载记录 $REC_COUNT: $sub ($rtype) domain=$domain id=$rid IP=${ip:-自动}"
     return 0
 }
 
@@ -481,7 +504,7 @@ parse_record_line() {
 load_records() {
     REC_COUNT=0
     REC_SUB=(); REC_DOMAIN=(); REC_ID=(); REC_TYPE=()
-    REC_IFACE=(); REC_TTL=(); REC_KEY=()
+    REC_IFACE=(); REC_TTL=(); REC_IP=(); REC_KEY=()
 
     if [ -n "${RECORDS_FILE:-}" ] && [ -f "$RECORDS_FILE" ]; then
         local line
@@ -521,7 +544,7 @@ load_records() {
         return 1
     fi
 
-    if ! parse_record_line "${SUB_DOMAIN}|${DOMAIN_ID}|${RECORD_ID}|${RECORD_TYPE}|${NETWORK_INTERFACE}|${RECORD_TTL}"; then
+    if ! parse_record_line "${SUB_DOMAIN}|${DOMAIN_ID}|${RECORD_ID}|${RECORD_TYPE}|${NETWORK_INTERFACE}|${RECORD_TTL}|${IP_ADDRESS:-}"; then
         return 1
     fi
     log_info "已加载 1 条记录（单记录模式）"
@@ -549,7 +572,6 @@ validate_config() {
         [ -z "$DOMAIN_ID" ] && missing+=("DOMAIN_ID")
         [ -z "$RECORD_ID" ] && missing+=("RECORD_ID")
         [ -z "$SUB_DOMAIN" ] && missing+=("SUB_DOMAIN")
-        [ -z "$RECORD_TYPE" ] && missing+=("RECORD_TYPE")
     elif [ ! -f "${RECORDS_FILE}" ]; then
         # 配置了记录文件但文件不存在：允许运行（records --generate 可创建它），
         # 但若同时提供了单记录字段则按单记录模式处理
@@ -572,11 +594,19 @@ validate_config() {
         exit 1
     fi
 
-    # 验证记录类型：只支持 A 和 AAAA
+    # 验证记录类型：只支持 AAAA (IPv6)，留空默认 AAAA
     # 多记录模式下每条记录的类型在 parse_record_line 中单独校验
-    if [ -n "$RECORD_TYPE" ] && [[ ! "$RECORD_TYPE" =~ ^(A|AAAA)$ ]]; then
-        log_error "RECORD_TYPE 必须是 A 或 AAAA，当前: $RECORD_TYPE"
+    if [ -n "$RECORD_TYPE" ] && [ "$RECORD_TYPE" != "AAAA" ]; then
+        log_error "本工具只支持 IPv6 (AAAA) 记录，当前: $RECORD_TYPE"
         exit 1
+    fi
+
+    # 验证固定 IP 地址（仅支持 IPv6；与记录类型的匹配在 parse_record_line 中逐条校验）
+    if [ -n "${IP_ADDRESS:-}" ]; then
+        if ! is_valid_ipv6 "$IP_ADDRESS"; then
+            log_error "IP_ADDRESS 只支持 IPv6 地址: $IP_ADDRESS"
+            exit 1
+        fi
     fi
 
     # 验证强制更新周期（必须为数字）
@@ -875,13 +905,20 @@ get_current_ipv6() {
     local interface="${1:-$NETWORK_INTERFACE}"
     local ip=""
 
+    # 多地址网卡（SLAAC 临时地址 600s 后会变 deprecated、ULA、静态地址并存）下，
+    # 优先取非 deprecated 的地址，避免挑到即将失效的临时地址；
+    # 全部 deprecated 时再退回第一个。
     if [ -n "$interface" ]; then
         # 从指定网卡获取 global scope 的 IPv6 地址
-        ip=$(ip -6 addr show dev "$interface" scope global 2>/dev/null | \
+        ip=$(ip -6 addr show dev "$interface" scope global 2>/dev/null | grep -v deprecated | \
+             grep -oP 'inet6 \K[0-9a-fA-F:]+' | head -1)
+        [ -n "$ip" ] || ip=$(ip -6 addr show dev "$interface" scope global 2>/dev/null | \
              grep -oP 'inet6 \K[0-9a-fA-F:]+' | head -1)
     else
         # 从所有网卡获取第一个 global scope 的 IPv6 地址
-        ip=$(ip -6 addr show scope global 2>/dev/null | \
+        ip=$(ip -6 addr show scope global 2>/dev/null | grep -v deprecated | \
+             grep -oP 'inet6 \K[0-9a-fA-F:]+' | head -1)
+        [ -n "$ip" ] || ip=$(ip -6 addr show scope global 2>/dev/null | \
              grep -oP 'inet6 \K[0-9a-fA-F:]+' | head -1)
     fi
 
@@ -1313,9 +1350,11 @@ do_status() {
         update_flag=$(cat "$FLAG_FILE" 2>/dev/null || echo "0")
         [ -n "$update_flag" ] || update_flag=0
 
-        # 本地 IP
+        # 本地 IP（固定地址 > 网卡检测）
         local local_ip=""
-        if [ "$rtype" = "AAAA" ]; then
+        if [ -n "${REC_IP[$idx]}" ]; then
+            local_ip="${REC_IP[$idx]}"
+        elif [ "$rtype" = "AAAA" ]; then
             local_ip=$(get_current_ipv6 "$iface")
         else
             local_ip=$(get_current_ipv4 "$iface")
@@ -1324,6 +1363,7 @@ do_status() {
         echo "  [$((idx + 1))] $sub ($rtype)"
         echo "      域名ID/记录ID: ${REC_DOMAIN[$idx]} / ${REC_ID[$idx]}"
         echo "      TTL: $ttl 秒 | 网卡: ${iface:-自动}"
+        echo "      IP 来源: $([ -n "${REC_IP[$idx]}" ] && echo "固定 ${REC_IP[$idx]}" || echo "网卡 ${iface:-自动} 检测")"
         echo "      本地 IP: ${local_ip:-未获取到}"
         echo "      上次 IP: ${old_ip:-无}"
         echo "      更新计数: ${update_flag}/${FORCE_UPDATE_CYCLE}"
@@ -1432,22 +1472,17 @@ do_test() {
                 errors=$((errors + 1))
             fi
 
-            # IP 获取
+            # IP 获取（固定地址直接展示，不做检测）
             local current_ip
-            if [ "$rtype" = "AAAA" ]; then
+            if [ -n "${REC_IP[$idx]}" ]; then
+                current_ip="${REC_IP[$idx]}"
+                echo "  固定 IP:   $current_ip（不做网卡检测）"
+            elif [ "$rtype" = "AAAA" ]; then
                 current_ip=$(get_current_ipv6 "$iface")
                 if is_valid_ipv6 "$current_ip"; then
                     echo "  IPv6 获取成功: $current_ip"
                 else
                     echo "  ✗ 无法获取有效 IPv6: '$current_ip'"
-                    errors=$((errors + 1))
-                fi
-            else
-                current_ip=$(get_current_ipv4 "$iface")
-                if is_valid_ipv4 "$current_ip"; then
-                    echo "  IPv4 获取成功: $current_ip"
-                else
-                    echo "  ✗ 无法获取有效 IPv4: '$current_ip'"
                     errors=$((errors + 1))
                 fi
             fi
@@ -1506,16 +1541,16 @@ do_list() {
     echo ""
     echo "来源: ${RECORDS_FILE:-配置文件（单记录模式）}"
     echo ""
-    printf "%-4s | %-16s | %-6s | %-10s | %-10s | %-6s | %s\n" \
-        "序号" "子域名" "类型" "域名ID" "记录ID" "TTL" "网卡"
-    echo "--------------------------------------------------------------------------------------------"
+    printf "%-4s | %-16s | %-6s | %-10s | %-10s | %-6s | %-8s | %s\n" \
+        "序号" "子域名" "类型" "域名ID" "记录ID" "TTL" "网卡" "IP"
+    echo "--------------------------------------------------------------------------------------------------------"
 
     local idx
     for ((idx=0; idx<REC_COUNT; idx++)); do
-        printf "%-4s | %-16s | %-6s | %-10s | %-10s | %-6s | %s\n" \
+        printf "%-4s | %-16s | %-6s | %-10s | %-10s | %-6s | %-8s | %s\n" \
             "$((idx + 1))" "${REC_SUB[$idx]}" "${REC_TYPE[$idx]}" \
             "${REC_DOMAIN[$idx]}" "${REC_ID[$idx]}" "${REC_TTL[$idx]}" \
-            "${REC_IFACE[$idx]:-自动}"
+            "${REC_IFACE[$idx]:-自动}" "${REC_IP[$idx]:-自动检测}"
     done
 
     echo ""
@@ -1669,7 +1704,7 @@ do_records() {
         idx=$((idx + 1))
         if [ "$ty" = "A" ] || [ "$ty" = "AAAA" ]; then
             printf "%-4s | %-16s | %-6s | %-12s | %s\n" "$idx" "$nm" "$ty" "$id" "$ttl"
-            usable+="${nm}|${domain_id}|${id}|${ty}||${ttl}"$'\n'
+            usable+="${nm}|${domain_id}|${id}|${ty}||${ttl}|"$'\n'
         else
             printf "%-4s | %-16s | %-6s | %-12s | %s\n" "$idx" "$nm" "$ty" "$id" "$ttl"
         fi
@@ -1734,7 +1769,7 @@ do_records_generate() {
     while IFS='|' read -r id nm ty ttl; do
         [ -z "$id" ] && continue
         if [ "$ty" = "A" ] || [ "$ty" = "AAAA" ]; then
-            lines+="${nm}|${domain_id}|${id}|${ty}||${ttl}"$'\n'
+            lines+="${nm}|${domain_id}|${id}|${ty}||${ttl}|"$'\n'
             count=$((count + 1))
         fi
     done <<< "$entries"
@@ -1755,7 +1790,8 @@ do_records_generate() {
         echo "# 自动生成: $(date '+%Y-%m-%d %H:%M:%S')"
         echo "# 来源: DNSPod Record.List ($domain)"
         echo "#"
-        echo "# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL"
+        echo "# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL|IP"
+        echo "# IP 字段留空 = 按网卡自动检测；固定某个公网 IPv6 地址时填入（仅支持 IPv6）"
         echo ""
         printf '%s' "$lines"
     } > "$outfile"
@@ -1891,24 +1927,21 @@ process_record() {
 
     log_info "----- 记录 $((idx + 1))/$REC_COUNT: $sub ($rtype) -----"
 
-    # 获取当前 IP 地址
+    # 获取当前 IP 地址（优先级：固定 IP > 网卡检测 > 自动检测）
     local current_ip
-    if [ "$rtype" = "AAAA" ]; then
+    local ip_pin="${REC_IP[$idx]}"
+    if [ -n "$ip_pin" ]; then
+        # 固定地址：直接推送，不依赖网卡当前状态（加载时已按记录类型校验过）
+        # 典型场景：运营商下发的公网 IPv6 静态分配但不在网卡检测的第一位
+        current_ip="$ip_pin"
+        log_info "[$sub] 使用固定 IP: $current_ip（不做网卡检测）"
+    elif [ "$rtype" = "AAAA" ]; then
         current_ip=$(get_current_ipv6 "$iface")
         if ! is_valid_ipv6 "$current_ip"; then
             log_error "[$sub] 无法获取有效的 IPv6 地址"
             log_error "[$sub] 检测到: '$current_ip'"
-            log_error "[$sub] 请检查网卡配置或网络状态"
+            log_error "[$sub] 请检查网卡配置或网络状态，或用 IP 字段固定该记录的地址"
             record_history "error" "${old_ip:-无}" "无" "获取 IPv6 失败" "$sub"
-            return 1
-        fi
-    else
-        current_ip=$(get_current_ipv4 "$iface")
-        if ! is_valid_ipv4 "$current_ip"; then
-            log_error "[$sub] 无法获取有效的 IPv4 地址"
-            log_error "[$sub] 检测到: '$current_ip'"
-            log_error "[$sub] 请检查网卡配置或网络状态"
-            record_history "error" "${old_ip:-无}" "无" "获取 IPv4 失败" "$sub"
             return 1
         fi
     fi

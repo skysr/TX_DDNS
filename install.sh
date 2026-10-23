@@ -14,7 +14,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # 版本信息
-VERSION="2.3.0"
+VERSION="2.7.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 安装路径
@@ -77,11 +77,67 @@ interactive_config() {
     fi
 
     # 网卡（全局默认，单条记录可单独覆盖）
+    # 带编号列出可用网卡及其当前公网地址，辅助选择
     echo ""
     echo "可用网卡:"
-    ip -br link show | grep -v "lo" | awk '{print "  - "$1}'
-    prompt "请输入网卡名称 (留空自动检测，作为默认值): "
-    read -r NETWORK_INTERFACE
+    local -a IFACE_NAMES=()
+    local recommend=""
+    local n=1 ifname v6 v4 mark
+    while read -r ifname; do
+        [ -z "$ifname" ] && continue
+        v6=$(ip -6 addr show dev "$ifname" scope global 2>/dev/null | grep -v deprecated | \
+             grep -oP 'inet6 \K[0-9a-fA-F:]+' | head -1)
+        v4=$(ip -4 addr show dev "$ifname" scope global 2>/dev/null | \
+             grep -oP 'inet \K[0-9.]+' | head -1)
+        IFACE_NAMES+=("$ifname")
+        mark=""
+        if [ -n "$v6" ]; then
+            mark=" [推荐]"
+            [ -z "$recommend" ] && recommend="$ifname"
+        fi
+        echo "  $n) $ifname$mark  IPv6: ${v6:-无}  IPv4: ${v4:-无}"
+        n=$((n + 1))
+    done < <(ip -br link show | awk '{print $1}' | grep -v '^lo$')
+
+    echo ""
+    if [ -n "$recommend" ]; then
+        prompt "请选择默认网卡 (编号或名称，留空自动检测，推荐: $recommend): "
+    else
+        prompt "请选择默认网卡 (编号或名称，留空自动检测): "
+    fi
+    read -r iface_sel
+    NETWORK_INTERFACE=""
+    if [ -n "$iface_sel" ]; then
+        if [[ "$iface_sel" =~ ^[0-9]+$ ]] && [ "$iface_sel" -ge 1 ] && [ "$iface_sel" -le "${#IFACE_NAMES[@]}" ]; then
+            NETWORK_INTERFACE="${IFACE_NAMES[$((iface_sel - 1))]}"
+        elif [[ "$iface_sel" =~ ^[a-zA-Z0-9._-]+$ ]] && ip link show "$iface_sel" &>/dev/null; then
+            NETWORK_INTERFACE="$iface_sel"
+        else
+            warn "未识别的网卡: $iface_sel，改为自动检测"
+        fi
+    fi
+    echo "  网卡默认值: ${NETWORK_INTERFACE:-自动检测}"
+
+    # 全局固定 IPv6（可选）：填写后直接以此地址更新，不做网卡检测
+    local ip_hint=""
+    if [ -n "$NETWORK_INTERFACE" ]; then
+        ip_hint=$(ip -6 addr show dev "$NETWORK_INTERFACE" scope global 2>/dev/null | grep -v deprecated | \
+                  grep -oP 'inet6 \K[0-9a-fA-F:]+' | head -1)
+    fi
+    echo ""
+    if [ -n "$ip_hint" ]; then
+        prompt "请输入默认 IPv6 地址 (留空使用该网卡当前: $ip_hint): "
+    else
+        prompt "请输入默认 IPv6 地址 (留空则按网卡自动检测): "
+    fi
+    read -r IP_ADDRESS
+    if [ -n "$IP_ADDRESS" ]; then
+        if ! { [[ "$IP_ADDRESS" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$IP_ADDRESS" == *:* ]]; }; then
+            error "IPv6 地址格式错误: $IP_ADDRESS（仅支持 IPv6）"
+            exit 1
+        fi
+        echo "  IP 默认值: $IP_ADDRESS（固定地址，不做网卡检测）"
+    fi
 
     # ---- 收集记录列表 ----
     RECORDS_LINES=()
@@ -113,14 +169,8 @@ interactive_config() {
             continue
         fi
 
-        # 记录类型（默认 AAAA）
-        echo "  记录类型: 1) AAAA (IPv6, 推荐)  2) A (IPv4)"
-        prompt "  选择 [1/2]: "
-        read -r rchoice
-        case "$rchoice" in
-            2) rtype="A";;
-            *) rtype="AAAA";;
-        esac
+        # 记录类型：本工具只支持 IPv6 (AAAA)，不再提问
+        rtype="AAAA"
 
         # 单条记录的网卡与 TTL（留空则用全局值）
         prompt "  网卡 (留空用默认 ${NETWORK_INTERFACE:-自动}): "
@@ -132,7 +182,27 @@ interactive_config() {
         [ -z "$rttl" ] && rttl=600
         [[ "$rttl" =~ ^[0-9]+$ ]] && [ "$rttl" -ge 1 ] || rttl=600
 
-        RECORDS_LINES+=("${sub}|${domain}|${rid}|${rtype}|${riface}|${rttl}")
+        # 单条记录的固定 IPv6（留空用全局 IP_ADDRESS，再留空则自动检测；A 记录不支持固定）
+        local rip=""
+        if [ "$rtype" = "AAAA" ]; then
+            local rhint=""
+            if [ -n "$riface" ]; then
+                rhint=$(ip -6 addr show dev "$riface" scope global 2>/dev/null | grep -v deprecated | \
+                         grep -oP 'inet6 \K[0-9a-fA-F:]+' | head -1)
+            fi
+            if [ -n "$rhint" ]; then
+                prompt "  IP (留空用该网卡当前: $rhint): "
+            else
+                prompt "  IP (留空用全局默认 ${IP_ADDRESS:-自动检测}): "
+            fi
+            read -r rip
+            [ -z "$rip" ] && rip="${IP_ADDRESS:-}"
+            if [ -n "$rip" ]; then
+                { [[ "$rip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$rip" == *:* ]] || { error "IPv6 地址无效: $rip，该条记录已跳过"; continue; }; }
+            fi
+        fi
+
+        RECORDS_LINES+=("${sub}|${domain}|${rid}|${rtype}|${riface}|${rttl}|${rip}")
         RECORD_COUNT=$((RECORD_COUNT + 1))
         echo "  ✓ 已添加: ${sub} (${rtype})"
         echo ""
@@ -144,8 +214,8 @@ interactive_config() {
     fi
 
     # 用第一条记录填充兼容字段（单记录模式下生效）
-    # 记录行格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL
-    IFS='|' read -r SUB_DOMAIN DOMAIN_ID RECORD_ID RECORD_TYPE _ _ <<< "${RECORDS_LINES[0]}"
+    # 记录行格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL|IP
+    IFS='|' read -r SUB_DOMAIN DOMAIN_ID RECORD_ID RECORD_TYPE _ _ _ <<< "${RECORDS_LINES[0]}"
 
     # 更新间隔（分钟）
     prompt "更新间隔分钟数 [1]: "
@@ -176,10 +246,11 @@ interactive_config() {
     echo "  Token:          ${LOGIN_TOKEN%%,*}****"
     echo "  记录数量:       $RECORD_COUNT"
     for line in "${RECORDS_LINES[@]}"; do
-        IFS='|' read -r s1 s2 s3 s4 s5 s6 <<< "$line"
-        echo "    - $s1 ($s4) 域名=$s2 记录=$s3 TTL=$s6 网卡=${s5:-自动}"
+        IFS='|' read -r s1 s2 s3 s4 s5 s6 s7 <<< "$line"
+        echo "    - $s1 ($s4) 域名=$s2 记录=$s3 TTL=$s6 网卡=${s5:-自动} IP=${s7:-自动检测}"
     done
     echo "  网卡默认值:     ${NETWORK_INTERFACE:-自动检测}"
+    echo "  IP 默认值:      ${IP_ADDRESS:-自动检测}"
     echo "  更新间隔:       每 ${INTERVAL} 分钟"
     echo "  Webhook:        ${WEBHOOK_URL:-未配置}"
     echo "=========================================="
@@ -201,8 +272,9 @@ generate_records_file() {
 # TX_DDNS 记录列表
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 #
-# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL
+# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL|IP
 # 子域名可为 www / nas / @ (主域名) / * (泛解析)
+# IP 字段留空 = 按网卡自动检测；固定某个公网 IPv6 地址时填入（仅支持 IPv6）
 
 EOF
     local line
@@ -239,11 +311,14 @@ DOMAIN_ID='$DOMAIN_ID'
 RECORD_ID='$RECORD_ID'
 SUB_DOMAIN='$SUB_DOMAIN'
 
-# 记录类型: A 或 AAAA
+# 记录类型: 固定 AAAA (IPv6，本工具只支持 IPv6)
 RECORD_TYPE='$RECORD_TYPE'
 
 # 网卡名称（留空自动检测）
 NETWORK_INTERFACE='$NETWORK_INTERFACE'
+
+# 固定 IPv6 地址（全局默认，留空则按网卡自动检测；记录列表第 7 字段可逐条覆盖，仅支持 IPv6）
+IP_ADDRESS='$IP_ADDRESS'
 
 # DNS TTL (秒)
 RECORD_TTL='$RECORD_TTL'
