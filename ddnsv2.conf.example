@@ -17,7 +17,7 @@ LOGIN_TOKEN='xxxxxxxx,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 # 【单记录模式】不设 RECORDS_FILE 时，使用下面的 DOMAIN_ID/RECORD_ID/SUB_DOMAIN
 
 # 多记录模式：记录列表文件路径
-# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL   （详见 records.list.example）
+# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL|IP   （详见 records.list.example）
 # 设置此项后，下面的 DOMAIN_ID/RECORD_ID/SUB_DOMAIN/RECORD_TYPE 不再生效
 RECORDS_FILE=''
 
@@ -33,6 +33,13 @@ RECORD_TYPE='AAAA'
 
 # 网卡名称（用于获取 IP，留空则自动检测）
 NETWORK_INTERFACE=''
+
+# 固定 IP 地址（全局默认，可选）
+# 填写后直接以此地址更新 DNS，不做网卡检测。
+# 多记录模式下每条记录可用记录列表第 7 字段 (IP) 单独覆盖。
+# 典型场景: 运营商下发的公网 IPv6 是静态分配/固定的，或不在脚本自动检测的第一位。
+# 注意: 固定后即使网卡当前没有该地址（如重启后 SLAAC 重新协商）也会按此值推送。
+IP_ADDRESS=''
 
 # 日志目录
 LOG_DIR='/var/log/ddns'

@@ -307,14 +307,25 @@ fi
 # 测试 14: 记录文件格式错误处理
 #-------------------------------------------------------------------------------
 head2 "测试 14: 记录文件错误处理"
+# 第 7 字段现在是 IP 字段：EXTRA 不是合法 IPv6 → 固定地址校验报错
 cat > "$MDIR/records.list" <<'EOF'
 www|100|201|AAAA|eth0|600|EXTRA
 EOF
 OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
-if echo "$OUT" | grep -q "字段过多"; then
-    ok "字段过多时报错"
+if echo "$OUT" | grep -q "固定的 IPv6 地址无效"; then
+    ok "第 7 字段（IP）非法时报错"
 else
-    bad "字段过多未报错" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
+    bad "第 7 字段（IP）非法未报错" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
+fi
+# 第 8 段开始才算字段过多
+cat > "$MDIR/records.list" <<'EOF'
+www|100|201|AAAA|eth0|600|2409:8a00::1|EXTRA
+EOF
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "字段过多"; then
+    ok "字段过多（8 段）时报错"
+else
+    bad "字段过多（8 段）未报错" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
 fi
 cat > "$MDIR/records.list" <<'EOF'
 www|100|201|INVALID
@@ -340,10 +351,10 @@ fi
 #-------------------------------------------------------------------------------
 head2 "测试 15: 安装器配置生成"
 # 静态检查：install.sh 的兼容字段赋值必须按正确的下标解析记录行
-# 记录行格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL
+# 记录行格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL|IP
 # 错误写法会把 DOMAIN_ID 赋成子域名、RECORD_ID 赋成域名ID
-if grep -q 'read -r SUB_DOMAIN DOMAIN_ID RECORD_ID RECORD_TYPE _ _ <<< "\${RECORDS_LINES\[0\]}"' "$SCRIPT_DIR/../install.sh"; then
-    ok "兼容字段按正确下标解析记录行"
+if grep -q 'read -r SUB_DOMAIN DOMAIN_ID RECORD_ID RECORD_TYPE _ _ _ <<< "\${RECORDS_LINES\[0\]}"' "$SCRIPT_DIR/../install.sh"; then
+    ok "兼容字段按正确下标解析记录行（含 IP 字段）"
 else
     bad "兼容字段解析下标错误（DOMAIN_ID/RECORD_ID/SUB_DOMAIN 会错位）"
 fi
@@ -494,6 +505,83 @@ if bash -n "$SCRIPT_DIR/../install.sh" 2>/dev/null; then
     ok "install.sh 语法正确"
 else
     bad "install.sh 存在语法错误"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 19: IP 固定（记录字段 > 全局 IP_ADDRESS > 自动检测）
+#-------------------------------------------------------------------------------
+head2 "测试 19: IP 固定"
+cat > "$MDIR/ddns.conf" <<EOF
+LOGIN_TOKEN='12345,abcdef123456'
+RECORDS_FILE='$MDIR/records.list'
+LOG_DIR='$MDIR/log'
+RECORD_TYPE='AAAA'
+RECORD_TTL=600
+IP_ADDRESS='2409:8a00::9'
+EOF
+cat > "$MDIR/records.list" <<'EOF'
+www|100|201|AAAA|eth0|600|2409:8a00::1
+nas|100|202|AAAA||600
+home|200|203|A||300|1.2.3.4
+EOF
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "共计 3 条记录"; then
+    ok "固定 / 全局默认 / 自动检测混合加载成功"
+else
+    bad "混合记录加载失败" "$(echo "$OUT" | tail -3 | tr '\n' ' ')"
+fi
+if echo "$OUT" | grep "^1 " | grep -q "2409:8a00::1"; then
+    ok "记录字段固定值生效（www → 2409:8a00::1）"
+else
+    bad "记录字段固定值未生效" "$(echo "$OUT" | grep '^1 ')"
+fi
+if echo "$OUT" | grep "^2 " | grep -q "2409:8a00::9"; then
+    ok "记录第 7 字段留空回退全局 IP_ADDRESS（nas → 2409:8a00::9）"
+else
+    bad "全局 IP_ADDRESS 回退未生效" "$(echo "$OUT" | grep '^2 ')"
+fi
+if echo "$OUT" | grep "^3 " | grep -q "1.2.3.4"; then
+    ok "A 记录可固定 IPv4（home → 1.2.3.4）"
+else
+    bad "A 记录 IPv4 固定未生效" "$(echo "$OUT" | grep '^3 ')"
+fi
+# 类型不匹配：全局固定 IPv6，A 记录未单独固定 → 必须报错
+cat > "$MDIR/records.list" <<'EOF'
+home|200|203|A||300
+EOF
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "固定的 IPv4 地址无效"; then
+    ok "固定地址与记录类型不匹配时报错（不推错值）"
+else
+    bad "类型不匹配未报错" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
+fi
+# 全局 IP_ADDRESS 本身格式非法 → 配置校验报错
+sed -i "s/IP_ADDRESS='2409:8a00::9'/IP_ADDRESS='not-an-ip'/" "$MDIR/ddns.conf"
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "IP_ADDRESS 不是合法的 IPv4/IPv6 地址"; then
+    ok "全局 IP_ADDRESS 格式非法时报错"
+else
+    bad "全局 IP_ADDRESS 格式非法未报错" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
+fi
+
+#-------------------------------------------------------------------------------
+# 测试 20: 安装器（网卡选择 + IP 固定输入）静态检查
+#-------------------------------------------------------------------------------
+head2 "测试 20: 安装器"
+if grep -q "IFACE_NAMES" "$SCRIPT_DIR/../install.sh" && grep -qE 'ip -6 addr show' "$SCRIPT_DIR/../install.sh"; then
+    ok "安装器列出网卡当前公网地址（编号选择）"
+else
+    bad "安装器未提供带地址的网卡选择"
+fi
+if grep -q "IP_ADDRESS" "$SCRIPT_DIR/../install.sh"; then
+    ok "安装器写入 IP_ADDRESS 配置"
+else
+    bad "安装器未写入 IP_ADDRESS"
+fi
+if grep -qF 'RECORDS_LINES+=("${sub}|${domain}|${rid}|${rtype}|${riface}|${rttl}|${rip}")' "$SCRIPT_DIR/../install.sh"; then
+    ok "安装器生成的记录行包含第 7 IP 字段"
+else
+    bad "安装器记录行缺少 IP 字段"
 fi
 
 #-------------------------------------------------------------------------------
