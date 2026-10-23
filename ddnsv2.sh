@@ -18,7 +18,7 @@
 #         - 自动检测本地 IPv4/IPv6 地址变化
 #         - 支持 DNSPod API 更新 DNS 记录
 #         - 支持多网卡指定（NETWORK_INTERFACE）
-#         - 支持固定公网 IP 地址（IP_ADDRESS / 记录列表第 7 字段）
+#         - 支持固定公网 IPv6 地址（IP_ADDRESS / 记录列表第 7 字段，仅 IPv6）
 #         - 支持强制周期更新（防止 DNS 记录过期）
 #         - 支持 Webhook 通知（Discord/Slack/Telegram/自定义）
 #         - 完善的日志记录和历史追踪
@@ -57,9 +57,10 @@
 #   NETWORK_INTERFACE - 可选，指定网卡名称，如 "eth0"、"ens33"
 #                       不填则自动选择第一个公网 IP
 #
-#   IP_ADDRESS        - 可选，固定 IP 地址（全局默认）
+#   IP_ADDRESS        - 可选，固定 IPv6 地址（全局默认，仅支持 IPv6）
 #                       填写后直接以此地址更新 DNS，不做网卡检测。
 #                       多记录模式下每条记录可用记录列表第 7 字段 (IP) 单独覆盖。
+#                       A (IPv4) 记录不支持固定地址，只能用网卡自动检测。
 #
 #===============================================================================
 
@@ -462,7 +463,7 @@ parse_record_line() {
         return 1
     fi
 
-    # 固定 IP：记录第 7 字段 > 全局 IP_ADDRESS，留空则自动检测
+    # 固定 IP（仅支持 IPv6）：记录第 7 字段 > 全局 IP_ADDRESS，留空则自动检测
     [ -z "${ip:-}" ] && ip="${IP_ADDRESS:-}"
     if [ -n "$ip" ]; then
         if [ "$rtype" = "AAAA" ]; then
@@ -471,10 +472,8 @@ parse_record_line() {
                 return 1
             fi
         else
-            if ! is_valid_ipv4 "$ip"; then
-                log_error "固定的 IPv4 地址无效: $ip (行: $line)"
-                return 1
-            fi
+            log_error "IP 字段只支持 IPv6 地址，A 记录请使用网卡自动检测: $line"
+            return 1
         fi
     fi
 
@@ -603,10 +602,10 @@ validate_config() {
         exit 1
     fi
 
-    # 验证固定 IP 地址（仅查格式；与记录类型的匹配在 parse_record_line 中逐条校验）
+    # 验证固定 IP 地址（仅支持 IPv6；与记录类型的匹配在 parse_record_line 中逐条校验）
     if [ -n "${IP_ADDRESS:-}" ]; then
-        if ! is_valid_ipv4 "$IP_ADDRESS" && ! is_valid_ipv6 "$IP_ADDRESS"; then
-            log_error "IP_ADDRESS 不是合法的 IPv4/IPv6 地址: $IP_ADDRESS"
+        if ! is_valid_ipv6 "$IP_ADDRESS"; then
+            log_error "IP_ADDRESS 只支持 IPv6 地址: $IP_ADDRESS"
             exit 1
         fi
     fi
@@ -1801,7 +1800,7 @@ do_records_generate() {
         echo "# 来源: DNSPod Record.List ($domain)"
         echo "#"
         echo "# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL|IP"
-        echo "# IP 字段留空 = 按网卡自动检测；需要固定某个公网地址时填入"
+        echo "# IP 字段留空 = 按网卡自动检测；固定某个公网 IPv6 地址时填入（仅支持 IPv6，A 记录不支持）"
         echo ""
         printf '%s' "$lines"
     } > "$outfile"
@@ -1959,7 +1958,7 @@ process_record() {
         if ! is_valid_ipv4 "$current_ip"; then
             log_error "[$sub] 无法获取有效的 IPv4 地址"
             log_error "[$sub] 检测到: '$current_ip'"
-            log_error "[$sub] 请检查网卡配置或网络状态，或用 IP 字段固定该记录的地址"
+            log_error "[$sub] 请检查网卡配置或网络状态"
             record_history "error" "${old_ip:-无}" "无" "获取 IPv4 失败" "$sub"
             return 1
         fi

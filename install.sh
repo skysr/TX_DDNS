@@ -118,7 +118,7 @@ interactive_config() {
     fi
     echo "  网卡默认值: ${NETWORK_INTERFACE:-自动检测}"
 
-    # 全局固定 IP（可选）：填写后直接以此地址更新，不做网卡检测
+    # 全局固定 IPv6（可选）：填写后直接以此地址更新，不做网卡检测
     local ip_hint=""
     if [ -n "$NETWORK_INTERFACE" ]; then
         ip_hint=$(ip -6 addr show dev "$NETWORK_INTERFACE" scope global 2>/dev/null | grep -v deprecated | \
@@ -126,15 +126,14 @@ interactive_config() {
     fi
     echo ""
     if [ -n "$ip_hint" ]; then
-        prompt "请输入默认 IP 地址 (留空使用该网卡当前: $ip_hint): "
+        prompt "请输入默认 IPv6 地址 (留空使用该网卡当前: $ip_hint): "
     else
-        prompt "请输入默认 IP 地址 (留空则按网卡自动检测): "
+        prompt "请输入默认 IPv6 地址 (留空则按网卡自动检测): "
     fi
     read -r IP_ADDRESS
     if [ -n "$IP_ADDRESS" ]; then
-        if ! [[ "$IP_ADDRESS" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && \
-           ! { [[ "$IP_ADDRESS" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$IP_ADDRESS" == *:* ]]; }; then
-            error "IP 地址格式错误: $IP_ADDRESS"
+        if ! { [[ "$IP_ADDRESS" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$IP_ADDRESS" == *:* ]]; }; then
+            error "IPv6 地址格式错误: $IP_ADDRESS（仅支持 IPv6）"
             exit 1
         fi
         echo "  IP 默认值: $IP_ADDRESS（固定地址，不做网卡检测）"
@@ -189,29 +188,23 @@ interactive_config() {
         [ -z "$rttl" ] && rttl=600
         [[ "$rttl" =~ ^[0-9]+$ ]] && [ "$rttl" -ge 1 ] || rttl=600
 
-        # 单条记录的固定 IP（留空用全局 IP_ADDRESS，再留空则自动检测）
-        local rhint=""
-        if [ -n "$riface" ]; then
-            if [ "$rtype" = "AAAA" ]; then
+        # 单条记录的固定 IPv6（留空用全局 IP_ADDRESS，再留空则自动检测；A 记录不支持固定）
+        local rip=""
+        if [ "$rtype" = "AAAA" ]; then
+            local rhint=""
+            if [ -n "$riface" ]; then
                 rhint=$(ip -6 addr show dev "$riface" scope global 2>/dev/null | grep -v deprecated | \
-                        grep -oP 'inet6 \K[0-9a-fA-F:]+' | head -1)
-            else
-                rhint=$(ip -4 addr show dev "$riface" scope global 2>/dev/null | \
-                        grep -oP 'inet \K[0-9.]+' | head -1)
+                         grep -oP 'inet6 \K[0-9a-fA-F:]+' | head -1)
             fi
-        fi
-        if [ -n "$rhint" ]; then
-            prompt "  IP (留空用该网卡当前: $rhint): "
-        else
-            prompt "  IP (留空用全局默认 ${IP_ADDRESS:-自动检测}): "
-        fi
-        read -r rip
-        [ -z "$rip" ] && rip="${IP_ADDRESS:-}"
-        if [ -n "$rip" ]; then
-            if [ "$rtype" = "AAAA" ]; then
-                { [[ "$rip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$rip" == *:* ]] || { error "IPv6 地址无效: $rip，该条记录已跳过"; continue; }; }
+            if [ -n "$rhint" ]; then
+                prompt "  IP (留空用该网卡当前: $rhint): "
             else
-                { [[ "$rip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { error "IPv4 地址无效: $rip，该条记录已跳过"; continue; }; }
+                prompt "  IP (留空用全局默认 ${IP_ADDRESS:-自动检测}): "
+            fi
+            read -r rip
+            [ -z "$rip" ] && rip="${IP_ADDRESS:-}"
+            if [ -n "$rip" ]; then
+                { [[ "$rip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$rip" == *:* ]] || { error "IPv6 地址无效: $rip，该条记录已跳过"; continue; }; }
             fi
         fi
 
@@ -287,7 +280,7 @@ generate_records_file() {
 #
 # 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL|IP
 # 子域名可为 www / nas / @ (主域名) / * (泛解析)
-# IP 字段留空 = 按网卡自动检测；需要固定某个公网地址时填入
+# IP 字段留空 = 按网卡自动检测；固定某个公网 IPv6 地址时填入（仅支持 IPv6，A 记录不支持）
 
 EOF
     local line
@@ -330,7 +323,7 @@ RECORD_TYPE='$RECORD_TYPE'
 # 网卡名称（留空自动检测）
 NETWORK_INTERFACE='$NETWORK_INTERFACE'
 
-# 固定 IP 地址（全局默认，留空则按网卡自动检测；记录列表第 7 字段可逐条覆盖）
+# 固定 IPv6 地址（全局默认，留空则按网卡自动检测；记录列表第 7 字段可逐条覆盖，仅支持 IPv6）
 IP_ADDRESS='$IP_ADDRESS'
 
 # DNS TTL (秒)

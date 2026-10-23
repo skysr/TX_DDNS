@@ -510,7 +510,7 @@ fi
 #-------------------------------------------------------------------------------
 # 测试 19: IP 固定（记录字段 > 全局 IP_ADDRESS > 自动检测）
 #-------------------------------------------------------------------------------
-head2 "测试 19: IP 固定"
+head2 "测试 19: IP 固定（仅支持 IPv6）"
 cat > "$MDIR/ddns.conf" <<EOF
 LOGIN_TOKEN='12345,abcdef123456'
 RECORDS_FILE='$MDIR/records.list'
@@ -519,16 +519,16 @@ RECORD_TYPE='AAAA'
 RECORD_TTL=600
 IP_ADDRESS='2409:8a00::9'
 EOF
+# 1) AAAA 固定值 / 全局默认回退
 cat > "$MDIR/records.list" <<'EOF'
 www|100|201|AAAA|eth0|600|2409:8a00::1
 nas|100|202|AAAA||600
-home|200|203|A||300|1.2.3.4
 EOF
 OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
-if echo "$OUT" | grep -q "共计 3 条记录"; then
-    ok "固定 / 全局默认 / 自动检测混合加载成功"
+if echo "$OUT" | grep -q "共计 2 条记录"; then
+    ok "AAAA 固定值 / 全局默认混合加载成功"
 else
-    bad "混合记录加载失败" "$(echo "$OUT" | tail -3 | tr '\n' ' ')"
+    bad "AAAA 记录加载失败" "$(echo "$OUT" | tail -3 | tr '\n' ' ')"
 fi
 if echo "$OUT" | grep "^1 " | grep -q "2409:8a00::1"; then
     ok "记录字段固定值生效（www → 2409:8a00::1）"
@@ -540,25 +540,38 @@ if echo "$OUT" | grep "^2 " | grep -q "2409:8a00::9"; then
 else
     bad "全局 IP_ADDRESS 回退未生效" "$(echo "$OUT" | grep '^2 ')"
 fi
-if echo "$OUT" | grep "^3 " | grep -q "1.2.3.4"; then
-    ok "A 记录可固定 IPv4（home → 1.2.3.4）"
+# A 记录填写 IP 字段（即使填的是合法 IPv4）也必须拒绝：IP 固定仅支持 IPv6
+cat > "$MDIR/records.list" <<'EOF'
+home|200|203|A||300|1.2.3.4
+EOF
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "IP 字段只支持 IPv6 地址"; then
+    ok "A 记录填写 IP 字段被拒绝（仅支持 IPv6）"
 else
-    bad "A 记录 IPv4 固定未生效" "$(echo "$OUT" | grep '^3 ')"
+    bad "A 记录填写 IP 字段未被拒绝" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
 fi
-# 类型不匹配：全局固定 IPv6，A 记录未单独固定 → 必须报错
+# 类型不匹配：全局固定 IPv6，A 记录未单独固定 → 回退全局后必须报错
 cat > "$MDIR/records.list" <<'EOF'
 home|200|203|A||300
 EOF
 OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
-if echo "$OUT" | grep -q "固定的 IPv4 地址无效"; then
-    ok "固定地址与记录类型不匹配时报错（不推错值）"
+if echo "$OUT" | grep -q "IP 字段只支持 IPv6 地址"; then
+    ok "A 记录回退到全局 IPv6 固定值时报错（不推错值）"
 else
-    bad "类型不匹配未报错" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
+    bad "A 记录回退全局 IPv6 未报错" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
 fi
-# 全局 IP_ADDRESS 本身格式非法 → 配置校验报错
-sed -i "s/IP_ADDRESS='2409:8a00::9'/IP_ADDRESS='not-an-ip'/" "$MDIR/ddns.conf"
+# 全局 IP_ADDRESS 是合法 IPv4 但非 IPv6 → 必须拒绝（仅支持 IPv6）
+sed -i "s/IP_ADDRESS='2409:8a00::9'/IP_ADDRESS='1.2.3.4'/" "$MDIR/ddns.conf"
 OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
-if echo "$OUT" | grep -q "IP_ADDRESS 不是合法的 IPv4/IPv6 地址"; then
+if echo "$OUT" | grep -q "IP_ADDRESS 只支持 IPv6 地址"; then
+    ok "全局 IP_ADDRESS 为 IPv4 时被拒绝（仅支持 IPv6）"
+else
+    bad "全局 IP_ADDRESS IPv4 未被拒绝" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
+fi
+# 全局 IP_ADDRESS 格式非法 → 配置校验报错
+sed -i "s/IP_ADDRESS='1.2.3.4'/IP_ADDRESS='not-an-ip'/" "$MDIR/ddns.conf"
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "IP_ADDRESS 只支持 IPv6 地址"; then
     ok "全局 IP_ADDRESS 格式非法时报错"
 else
     bad "全局 IP_ADDRESS 格式非法未报错" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
