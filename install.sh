@@ -169,14 +169,8 @@ interactive_config() {
             continue
         fi
 
-        # 记录类型（默认 AAAA）
-        echo "  记录类型: 1) AAAA (IPv6, 推荐)  2) A (IPv4)"
-        prompt "  选择 [1/2]: "
-        read -r rchoice
-        case "$rchoice" in
-            2) rtype="A";;
-            *) rtype="AAAA";;
-        esac
+        # 记录类型：本工具只支持 IPv6 (AAAA)，不再提问
+        rtype="AAAA"
 
         # 单条记录的网卡与 TTL（留空则用全局值）
         prompt "  网卡 (留空用默认 ${NETWORK_INTERFACE:-自动}): "
@@ -280,7 +274,7 @@ generate_records_file() {
 #
 # 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL|IP
 # 子域名可为 www / nas / @ (主域名) / * (泛解析)
-# IP 字段留空 = 按网卡自动检测；固定某个公网 IPv6 地址时填入（仅支持 IPv6，A 记录不支持）
+# IP 字段留空 = 按网卡自动检测；固定某个公网 IPv6 地址时填入（仅支持 IPv6）
 
 EOF
     local line
@@ -317,7 +311,7 @@ DOMAIN_ID='$DOMAIN_ID'
 RECORD_ID='$RECORD_ID'
 SUB_DOMAIN='$SUB_DOMAIN'
 
-# 记录类型: A 或 AAAA
+# 记录类型: 固定 AAAA (IPv6，本工具只支持 IPv6)
 RECORD_TYPE='$RECORD_TYPE'
 
 # 网卡名称（留空自动检测）

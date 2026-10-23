@@ -52,7 +52,7 @@
 #
 #   SUB_DOMAIN      - 子域名，如 "www"、"@"（主域名）、"*"（泛解析）
 #
-#   RECORD_TYPE     - 记录类型，支持 "A" (IPv4) 或 "AAAA" (IPv6)
+#   RECORD_TYPE     - 记录类型，固定为 "AAAA" (IPv6，本工具只支持 IPv6；留空默认 AAAA)
 #
 #   NETWORK_INTERFACE - 可选，指定网卡名称，如 "eth0"、"ens33"
 #                       不填则自动选择第一个公网 IP
@@ -446,14 +446,14 @@ parse_record_line() {
         return 1
     fi
 
-    # 后三个字段回退到全局配置
-    [ -z "${rtype:-}" ] && rtype="$RECORD_TYPE"
+    # 后三个字段回退到全局配置（类型留空默认 AAAA，本工具只支持 IPv6）
+    [ -z "${rtype:-}" ] && rtype="AAAA"
     [ -z "${iface:-}" ] && iface="$NETWORK_INTERFACE"
     [ -z "${ttl:-}" ] && ttl="$RECORD_TTL"
 
-    # 校验记录类型
-    if [[ ! "$rtype" =~ ^(A|AAAA)$ ]]; then
-        log_error "记录类型必须是 A 或 AAAA: $line"
+    # 校验记录类型：只支持 AAAA (IPv6)
+    if [ "$rtype" != "AAAA" ]; then
+        log_error "本工具只支持 IPv6 (AAAA) 记录: $line"
         return 1
     fi
 
@@ -572,7 +572,6 @@ validate_config() {
         [ -z "$DOMAIN_ID" ] && missing+=("DOMAIN_ID")
         [ -z "$RECORD_ID" ] && missing+=("RECORD_ID")
         [ -z "$SUB_DOMAIN" ] && missing+=("SUB_DOMAIN")
-        [ -z "$RECORD_TYPE" ] && missing+=("RECORD_TYPE")
     elif [ ! -f "${RECORDS_FILE}" ]; then
         # 配置了记录文件但文件不存在：允许运行（records --generate 可创建它），
         # 但若同时提供了单记录字段则按单记录模式处理
@@ -595,10 +594,10 @@ validate_config() {
         exit 1
     fi
 
-    # 验证记录类型：只支持 A 和 AAAA
+    # 验证记录类型：只支持 AAAA (IPv6)，留空默认 AAAA
     # 多记录模式下每条记录的类型在 parse_record_line 中单独校验
-    if [ -n "$RECORD_TYPE" ] && [[ ! "$RECORD_TYPE" =~ ^(A|AAAA)$ ]]; then
-        log_error "RECORD_TYPE 必须是 A 或 AAAA，当前: $RECORD_TYPE"
+    if [ -n "$RECORD_TYPE" ] && [ "$RECORD_TYPE" != "AAAA" ]; then
+        log_error "本工具只支持 IPv6 (AAAA) 记录，当前: $RECORD_TYPE"
         exit 1
     fi
 
@@ -1486,14 +1485,6 @@ do_test() {
                     echo "  ✗ 无法获取有效 IPv6: '$current_ip'"
                     errors=$((errors + 1))
                 fi
-            else
-                current_ip=$(get_current_ipv4 "$iface")
-                if is_valid_ipv4 "$current_ip"; then
-                    echo "  IPv4 获取成功: $current_ip"
-                else
-                    echo "  ✗ 无法获取有效 IPv4: '$current_ip'"
-                    errors=$((errors + 1))
-                fi
             fi
         done
     fi
@@ -1800,7 +1791,7 @@ do_records_generate() {
         echo "# 来源: DNSPod Record.List ($domain)"
         echo "#"
         echo "# 格式: 子域名|域名ID|记录ID|记录类型|网卡|TTL|IP"
-        echo "# IP 字段留空 = 按网卡自动检测；固定某个公网 IPv6 地址时填入（仅支持 IPv6，A 记录不支持）"
+        echo "# IP 字段留空 = 按网卡自动检测；固定某个公网 IPv6 地址时填入（仅支持 IPv6）"
         echo ""
         printf '%s' "$lines"
     } > "$outfile"
@@ -1951,15 +1942,6 @@ process_record() {
             log_error "[$sub] 检测到: '$current_ip'"
             log_error "[$sub] 请检查网卡配置或网络状态，或用 IP 字段固定该记录的地址"
             record_history "error" "${old_ip:-无}" "无" "获取 IPv6 失败" "$sub"
-            return 1
-        fi
-    else
-        current_ip=$(get_current_ipv4 "$iface")
-        if ! is_valid_ipv4 "$current_ip"; then
-            log_error "[$sub] 无法获取有效的 IPv4 地址"
-            log_error "[$sub] 检测到: '$current_ip'"
-            log_error "[$sub] 请检查网卡配置或网络状态"
-            record_history "error" "${old_ip:-无}" "无" "获取 IPv4 失败" "$sub"
             return 1
         fi
     fi

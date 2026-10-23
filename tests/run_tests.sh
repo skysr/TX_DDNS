@@ -221,7 +221,7 @@ cat > "$MDIR/records.list" <<'EOF'
 # 子域名|域名ID|记录ID|类型|网卡|TTL
 www|100|201|AAAA|eth0|600
 nas|100|202|AAAA||
-home|200|203|A||300
+home|200|203|AAAA||300
 @|100|204|AAAA|eth0|
 *|100|205|AAAA|eth0|900
 EOF
@@ -232,11 +232,29 @@ if echo "$OUT" | grep -q "共计 5 条记录"; then
 else
     bad "list 命令记录数不正确" "$(echo "$OUT" | tail -3 | tr '\n' ' ')"
 fi
-if echo "$OUT" | grep -qE "home.*A.*200.*203.*300"; then
-    ok "字段回退正确（home 显式 TTL=300，类型 A）"
+if echo "$OUT" | grep -qE "home.*AAAA.*200.*203.*300"; then
+    ok "字段回退正确（home 显式 TTL=300，类型 AAAA）"
 else
     bad "字段回退不正确"
 fi
+# A (IPv4) 记录类型不再支持
+cat > "$MDIR/records.list" <<'EOF'
+www|100|201|A|eth0|600
+EOF
+OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
+if echo "$OUT" | grep -q "本工具只支持 IPv6 (AAAA) 记录"; then
+    ok "A (IPv4) 记录类型被拒绝（IPv6-only）"
+else
+    bad "A 记录类型未被拒绝" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
+fi
+# 恢复多记录列表（测试 12 依赖）
+cat > "$MDIR/records.list" <<'EOF'
+www|100|201|AAAA|eth0|600
+nas|100|202|AAAA||
+home|200|203|AAAA||300
+@|100|204|AAAA|eth0|
+*|100|205|AAAA|eth0|900
+EOF
 
 #-------------------------------------------------------------------------------
 # 测试 11: 记录 key 唯一性（@ 与 * 不能冲突）
@@ -331,10 +349,10 @@ cat > "$MDIR/records.list" <<'EOF'
 www|100|201|INVALID
 EOF
 OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
-if echo "$OUT" | grep -q "记录类型必须是"; then
-    ok "非法记录类型时报错"
+if echo "$OUT" | grep -q "本工具只支持 IPv6 (AAAA) 记录"; then
+    ok "非 AAAA 记录类型时报错"
 else
-    bad "非法记录类型未报错"
+    bad "非 AAAA 记录类型未报错"
 fi
 cat > "$MDIR/records.list" <<'EOF'
 www|100
@@ -540,25 +558,15 @@ if echo "$OUT" | grep "^2 " | grep -q "2409:8a00::9"; then
 else
     bad "全局 IP_ADDRESS 回退未生效" "$(echo "$OUT" | grep '^2 ')"
 fi
-# A 记录填写 IP 字段（即使填的是合法 IPv4）也必须拒绝：IP 固定仅支持 IPv6
+# A (IPv4) 记录类型不再支持（填 IP 与否都先过类型校验）
 cat > "$MDIR/records.list" <<'EOF'
 home|200|203|A||300|1.2.3.4
 EOF
 OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
-if echo "$OUT" | grep -q "IP 字段只支持 IPv6 地址"; then
-    ok "A 记录填写 IP 字段被拒绝（仅支持 IPv6）"
+if echo "$OUT" | grep -q "本工具只支持 IPv6 (AAAA) 记录"; then
+    ok "A (IPv4) 记录类型被拒绝（IPv6-only）"
 else
-    bad "A 记录填写 IP 字段未被拒绝" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
-fi
-# 类型不匹配：全局固定 IPv6，A 记录未单独固定 → 回退全局后必须报错
-cat > "$MDIR/records.list" <<'EOF'
-home|200|203|A||300
-EOF
-OUT=$(bash "$DDNS" list -c "$MDIR/ddns.conf" 2>&1)
-if echo "$OUT" | grep -q "IP 字段只支持 IPv6 地址"; then
-    ok "A 记录回退到全局 IPv6 固定值时报错（不推错值）"
-else
-    bad "A 记录回退全局 IPv6 未报错" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
+    bad "A 记录类型未被拒绝" "$(echo "$OUT" | tail -2 | tr '\n' ' ')"
 fi
 # 全局 IP_ADDRESS 是合法 IPv4 但非 IPv6 → 必须拒绝（仅支持 IPv6）
 sed -i "s/IP_ADDRESS='2409:8a00::9'/IP_ADDRESS='1.2.3.4'/" "$MDIR/ddns.conf"
